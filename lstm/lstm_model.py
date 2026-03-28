@@ -34,7 +34,7 @@ class MoETraceClassifier(nn.Module):
         return self.classifier(ht[-1])
 
 class MoETraceClassifierLinear(nn.Module):
-    def __init__(self, num_total_experts, num_layers, top_k, embed_dim=16, hidden_dim=64):
+    def __init__(self, num_total_experts, num_layers, embed_dim=16, hidden_dim=64):
         super().__init__()
         
         self.num_total_experts = num_total_experts

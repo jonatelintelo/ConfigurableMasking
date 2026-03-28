@@ -19,7 +19,7 @@ torch.cuda.manual_seed_all(SEED)
 
 def train(traces, labels, num_total_experts):
     # --- Config ---
-    BATCH_SIZE = 1024
+    BATCH_SIZE = 512
     LR = 0.01
     EPOCHS = 30
 
@@ -50,7 +50,6 @@ def train(traces, labels, num_total_experts):
     model = lstm_model.MoETraceClassifierLinear(
         num_total_experts=num_total_experts,
         num_layers=DETECTED_LAYERS,
-        top_k=DETECTED_TOP_K,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -151,7 +150,7 @@ def train(traces, labels, num_total_experts):
         tqdm.write("-" * 50)
 
     print("\n✅ Training complete.")
-    return model, val_loader, criterion, DETECTED_LAYERS, DETECTED_TOP_K
+    return model, val_loader, criterion, DETECTED_LAYERS
 
 
 if __name__ == "__main__":
@@ -189,12 +188,11 @@ if __name__ == "__main__":
     traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_traces.pkl")
     labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_labels.pkl")
 
-    trained_lstm_model, val_loader, criterion, DETECTED_LAYERS, DETECTED_TOP_K = train(traces, labels, num_total_experts=model_config.num_router_expert)
+    trained_lstm_model, val_loader, criterion, DETECTED_LAYERS = train(traces, labels, num_total_experts=model_config.num_router_expert)
 
     checkpoint = {
         'num_total_experts': model_config.num_router_expert,
         'num_layers': DETECTED_LAYERS,
-        'top_k': DETECTED_TOP_K,
         'model_state_dict': trained_lstm_model.state_dict()
     }
 
@@ -209,8 +207,7 @@ if __name__ == "__main__":
 
     loaded_model = lstm_model.MoETraceClassifierLinear(
         num_total_experts=checkpoint['num_total_experts'],
-        num_layers=checkpoint['num_layers'],
-        top_k=checkpoint['top_k']
+        num_layers=checkpoint['num_layers']
     )
 
     loaded_model.load_state_dict(checkpoint['model_state_dict'])

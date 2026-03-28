@@ -3,6 +3,8 @@ import pickle
 import numpy as np
 import re
 
+from datasets import load_dataset
+
 
 def save_data(data, directory):
     with open(directory, "wb") as fp:
@@ -40,6 +42,30 @@ def load_twinset(root_folder, malicious_only):
 
         print(f"\nNumber of malicious prompts: {len(malicious_questions)}")
         print(f"Number of benign prompts: {len(benign_questions)}")
+
+    return questions, labels
+
+
+def load_adult_set(root_folder, model_name, malicious_only):
+    if malicious_only:
+        malicious_questions = list(load_dataset("json", data_files=f"{root_folder}/data/adult_refusal/{model_name}_adult_refusal_prompts.jsonl")["train"]["prompt"])
+
+        questions = malicious_questions
+        labels = np.array([1] * len(malicious_questions))
+
+        print(f"\nNumber of malicious prompts: {len(malicious_questions)}")
+    else:
+        malicious_questions = list(load_dataset("json", data_files=f"{root_folder}/data/adult_refusal/{model_name}_adult_refusal_prompts.jsonl")["train"]["prompt"])
+
+        benign_questions = load_dataset("facebook/natural_reasoning")["train"]["question"][: len(malicious_questions)]
+
+        questions = malicious_questions + benign_questions
+        labels = np.array([1] * len(malicious_questions) + [0] * len(benign_questions))
+
+        print(f"\nNumber of malicious prompts: {len(malicious_questions)}")
+        print(f"Number of benign prompts: {len(benign_questions)}")
+        print(f"Total number of question: {len(questions)}")
+        print(f"Total number of labels: {len(labels)}")
 
     return questions, labels
 

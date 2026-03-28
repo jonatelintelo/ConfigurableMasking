@@ -7,6 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from collections import defaultdict
 from tqdm import tqdm
 import types
+import gc
 
 
 def load_model(full_model_name):
@@ -145,7 +146,6 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
                 **input_tokens,
                 max_new_tokens=max_new_tokens,
                 return_dict_in_generate=True,
-                max_length=max_new_tokens,
             )
 
             generated_tokens = [output[ids.shape[-1] :] for ids, output in zip(input_ids, output_ids["sequences"])]
@@ -155,6 +155,51 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
             all_outputs.extend(responses)
 
     return all_outputs
+
+
+def generate_output_with_yield(model, model_name, tokenizer, prompts, batch_size):
+    if model_name in [
+        "gpt-oss-20b",
+        "pangu-pro-moe-model",
+        "Kimi-VL-A3B-Thinking",
+        "Hunyuan-A13B-Instruct",
+        "Kimi-VL-A3B-Thinking-2506",
+    ]:
+        max_new_tokens = 1024  # We give thinking models more token budget
+    else:
+        max_new_tokens = 128
+
+    all_outputs = []
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    model.eval()
+    with torch.no_grad():
+        for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches):
+            input_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+
+            if "token_type_ids" in input_tokens:
+                forward_args = inspect.signature(model.forward).parameters
+                if "token_type_ids" not in forward_args:
+                    input_tokens.pop("token_type_ids")
+
+            input_ids = input_tokens["input_ids"]
+
+            output_ids = model.generate(
+                **input_tokens,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+            )
+
+            generated_tokens = [output[ids.shape[-1] :] for ids, output in zip(input_ids, output_ids["sequences"])]
+
+            responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
+
+            # 1. YIELD instead of extending a list
+            yield responses
+
+            # 2. Force memory cleanup before the next batch loads
+            del input_tokens, input_ids, output_ids, generated_tokens
+            torch.cuda.empty_cache()
+            gc.collect()
 
 
 def moderate(model, tokenizer, prompt):
@@ -217,99 +262,3 @@ def get_activation_hook(model_name, layer_name, top_k_expert_indices, k):
             raise ValueError(f"Activation hook for {model_name} is not implemented.")
 
     return activation_hook
-
-
-def register_pruning_hooks_candidates(model_name, model, candidates):
-    hook_handles = []
-
-    for candidate in candidates:  # Start pruning every candidate
-        for layer_name, module in model.named_modules():  # Loop over all layers
-            if layer_name.lower().endswith(candidate[0]):  # Find the layer in the model which matches with current candidate
-                hook_fn = get_pruning_hook_candidates(model_name, layer_name, candidate[1])
-                handle = module.register_forward_hook(hook_fn)
-                hook_handles.append(handle)
-                break  # break because we only need to register on this layer once
-
-    return hook_handles
-
-
-def get_pruning_hook_candidates(model_name, layer_name, expert_index):
-    # print(f"Pruning hook on layer: '{layer_name}' and expert '{expert_index}'")
-
-    def prune_hook(module, input, output):
-        if model_name in [
-            "Qwen3-30B-A3B-Instruct-2507",
-            "Phi-3.5-MoE-instruct",
-            "Mixtral-8x7B-Instruct-v0.1",
-            "gpt-oss-20b",
-            "Qwen1.5-MoE-A2.7B-Chat",
-            "Hunyuan-A13B-Instruct",
-            "pangu-pro-moe-model",
-        ]:
-            pruned_output = output.clone()
-            pruned_output[..., expert_index] = float("-inf")
-            return pruned_output
-        elif model_name == "deepseek-moe-16b-chat":
-            pruned_output = output[2]
-            pruned_output[..., expert_index] = float("-inf")
-            scores = pruned_output.softmax(dim=-1)
-            topk_weight, topk_indices = torch.topk(scores, k=6, dim=-1, sorted=False)  # [batch_size * seq_len, topk]
-            return topk_indices, topk_weight, pruned_output
-        else:
-            print("---------------------------------------------------------------")
-            print(input)
-            print("---------------------------------------------------------------")
-            print(output)
-            print("---------------------------------------------------------------")
-            print(output.shape)
-            print("---------------------------------------------------------------")
-            raise ValueError(f"Pruning hook for {model_name} is not implemented.")
-
-    return prune_hook
-
-
-def register_global_pruning_hooks(model_name, model, gate_name, experts):
-    hook_handles = []
-
-    for layer_name, module in model.named_modules():
-        if layer_name.lower().endswith(gate_name):
-            hook_fn = get_global_pruning_hook(model_name, layer_name, experts)
-            handle = module.register_forward_hook(hook_fn)
-            hook_handles.append(handle)
-
-    return hook_handles
-
-
-def get_global_pruning_hook(model_name, layer_name, experts):
-    # print(f"Pruning hook on layer: '{layer_name}' and expert '{expert_index}'")
-
-    def global_prune_hook(module, input, output):
-        if model_name in [
-            "Qwen3-30B-A3B-Instruct-2507",
-            "Phi-3.5-MoE-instruct",
-            "Mixtral-8x7B-Instruct-v0.1",
-            "gpt-oss-20b",
-            "Qwen1.5-MoE-A2.7B-Chat",
-            "Hunyuan-A13B-Instruct",
-            "pangu-pro-moe-model",
-        ]:
-            pruned_output = output.clone()
-            pruned_output[..., experts] = float("-inf")
-            return pruned_output
-        elif model_name == "deepseek-moe-16b-chat":
-            pruned_output = output[2]
-            pruned_output[..., experts] = float("-inf")
-            scores = pruned_output.softmax(dim=-1)
-            topk_weight, topk_indices = torch.topk(scores, k=6, dim=-1, sorted=False)  # [batch_size * seq_len, topk]
-            return topk_indices, topk_weight, pruned_output
-        else:
-            print("---------------------------------------------------------------")
-            print(input)
-            print("---------------------------------------------------------------")
-            print(output)
-            print("---------------------------------------------------------------")
-            print(output.shape)
-            print("---------------------------------------------------------------")
-            raise ValueError(f"Pruning hook for {model_name} is not implemented.")
-
-    return global_prune_hook

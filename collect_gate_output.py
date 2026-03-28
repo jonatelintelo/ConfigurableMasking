@@ -31,7 +31,7 @@ def find_numpy_indices(input_tokens_question, input_tokens_prompt, print_logging
                     print(f"start, end: {start, end}")
                 return start, end
 
-                
+
 if __name__ == "__main__":
     arguments = argument_parser.parse_arguments()
     root_folder = arguments.root
@@ -64,7 +64,8 @@ if __name__ == "__main__":
 
     model, tokenizer = model_utils.load_model(models[model_id])
 
-    questions, labels = data_utils.load_twinset(root_folder, malicious_only=False)  # label 1 = refusal behavior
+    # questions, labels = data_utils.load_twinset(root_folder, malicious_only=False)  # label 1 = refusal behavior
+    questions, labels = data_utils.load_adult_set(root_folder, model_config.model_name, malicious_only=False)  # label 1 = refusal behavior
 
     hook_handles, top_k_expert_indices = model_utils.register_activation_hooks(model_config.model_name, model, model_config.top_k, model_config.gate_name)
 
@@ -94,12 +95,18 @@ if __name__ == "__main__":
     if print_logging:
         print("\n-----------------------------------------------------")
         print("-----------------------------------------------------")
-        for layer_name in top_k_expert_indices:
+        for layer_index, layer_name in enumerate(top_k_expert_indices):
             print(f"Number of batches recorded in layer '{layer_name}': '{len(top_k_expert_indices[layer_name])}'")
             print(f"top_k_expert_indices[{layer_name}][0]: '{top_k_expert_indices[layer_name][0]}'")
 
             for batch_index, batch_expert_indices in enumerate(top_k_expert_indices[layer_name]):
                 print(f"Layer: '{layer_name}', batch_index: '{batch_index}', shape: '{batch_expert_indices.shape}'")
+
+                if batch_index == 4:
+                    break
+
+            if layer_index == 1:
+                break
         print("-----------------------------------------------------")
         print("-----------------------------------------------------")
 
@@ -118,12 +125,18 @@ if __name__ == "__main__":
     if print_logging:
         print("\n-----------------------------------------------------")
         print("-----------------------------------------------------")
-        for layer_name in top_k_expert_indices:
+        for layer_index, layer_name in enumerate(top_k_expert_indices):
             print(f"Number of batches recorded in layer '{layer_name}': '{len(top_k_expert_indices[layer_name])}'")
             print(f"top_k_expert_indices[{layer_name}][0]: '{top_k_expert_indices[layer_name][0]}'")
 
             for batch_index, batch_expert_indices in enumerate(top_k_expert_indices[layer_name]):
                 print(f"Layer: '{layer_name}', batch_index: '{batch_index}', shape: '{batch_expert_indices.shape}'")
+
+                if batch_index == 4:
+                    break
+
+            if layer_index == 1:
+                break
         print("-----------------------------------------------------")
         print("-----------------------------------------------------")
 
@@ -167,7 +180,7 @@ if __name__ == "__main__":
                     "input_ids"
                 ][0]
 
-            if print_logging:
+            if print_logging and prompt_index < 2:
                 print("\n-----------------------------------------------------")
                 print("-----------------------------------------------------")
                 print(f"batch_prompts[prompt_index]: {batch_prompts[prompt_index]}")
@@ -179,13 +192,22 @@ if __name__ == "__main__":
                 print("-----------------------------------------------------")
                 print("-----------------------------------------------------")
 
-            start, end = find_numpy_indices(input_tokens_question, input_tokens_prompt, print_logging)
+            start, end = find_numpy_indices(input_tokens_question, input_tokens_prompt, prompt_index < 2)
 
             for layer_name in top_k_expert_indices:
-                filtered_expert_choices_per_token[layer_name].append(top_k_expert_indices[layer_name][batch_index][prompt_index][start : end + 1])
+                # filtered_expert_choices_per_token[layer_name].append(top_k_expert_indices[layer_name][batch_index][prompt_index][start : end + 1])
+                # 1. Extract the PyTorch slice
+                expert_slice = top_k_expert_indices[layer_name][batch_index][prompt_index][start : end + 1]
+                
+                # 2. Move to CPU, convert to NumPy, downcast, and COPY to break the view linkage
+                # Use int16 just to be safe (supports up to 32,767 experts)
+                expert_slice_optimized = expert_slice.cpu().numpy().astype(np.int16).copy()
+                
+                # 3. Append the clean, tiny NumPy array
+                filtered_expert_choices_per_token[layer_name].append(expert_slice_optimized)
 
     if print_logging:
-        for layer_name in filtered_expert_choices_per_token:
+        for layer_index, layer_name in enumerate(filtered_expert_choices_per_token):
             print("\n-----------------------------------------------------")
             print("-----------------------------------------------------")
 
@@ -193,6 +215,12 @@ if __name__ == "__main__":
 
             for prompt_index, prompt_expert_indices in enumerate(filtered_expert_choices_per_token[layer_name]):
                 print(f"Layer: '{layer_name}', prompt_index: '{prompt_index}', shape: '{prompt_expert_indices.shape}'")
+
+                if prompt_index == 2:
+                    break
+
+            if layer_index == 1:
+                break
 
     data_utils.create_directory(f"{root_folder}/results/gate_output/{model_config.model_name}")
 

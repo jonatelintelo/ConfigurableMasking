@@ -20,7 +20,7 @@ def get_token_traces(activations_dict, print_logging):
     """
     result_traces = {}
 
-    # 1. Sort the layer keys numerically (0 to 31)
+    # 1. Sort the layer keys numerically
     # This ensures we build the path in the correct order of depth.
     layer_keys = sorted(
         activations_dict.keys(),
@@ -35,8 +35,8 @@ def get_token_traces(activations_dict, print_logging):
     # We assume the list of tensors is the same length across all layers
     first_layer_data = activations_dict[layer_keys[0]]
 
-    if print_logging:
-        print(f"first_layer_data: {first_layer_data}")
+    # if print_logging:
+    #     print(f"first_layer_data: {first_layer_data}")
 
     num_prompts = len(first_layer_data)
 
@@ -52,7 +52,7 @@ def get_token_traces(activations_dict, print_logging):
         tensor_shape = first_layer_data[prompt_idx].shape
         num_tokens = tensor_shape[0]
 
-        if print_logging:
+        if print_logging and prompt_idx < 2:
             print(f"num_tokens: {num_tokens}")
 
         # Initialize the list for every token in this prompt
@@ -110,7 +110,7 @@ if __name__ == "__main__":
     expert_indices = data_utils.load_data(f"{root_folder}/results/gate_output/{model_config.model_name}/{model_config.model_name}_expert_indices.pkl")
 
     if print_logging:
-        for layer_name in expert_indices:
+        for layer_index, layer_name in enumerate(expert_indices):
             print(f"Number of prompts recorded in layer '{layer_name}': {len(expert_indices[layer_name])}")
             print(f"expert_indices[{layer_name}][0]: {expert_indices[layer_name][0]}")
             print(f"expert_indices[{layer_name}][-1]: {expert_indices[layer_name][-1]}")
@@ -118,14 +118,20 @@ if __name__ == "__main__":
             for prompt_index, prompt_expert_indices in enumerate(expert_indices[layer_name]):
                 print(f"Layer: '{layer_name}', prompt_index: '{prompt_index}', shape: '{prompt_expert_indices.shape}'")
 
+                if prompt_index == 2:
+                    break
+
+            if layer_index == 1:
+                break
+
     traces = get_token_traces(expert_indices, print_logging)
-    _, labels = data_utils.load_twinset(root_folder, malicious_only=False)  # label 1 = refusal behavior
+    _, labels = data_utils.load_adult_set(root_folder, model_config.model_name, malicious_only=False)  # label 1 = refusal behavior
 
     if print_logging:
         print(f"traces[0]: {traces[0]}")
         print(f"labels[0]: {labels[0]}")
-        print(f"traces[390]: {traces[390]}")
-        print(f"labels[390]: {labels[390]}")
+        print(f"traces[-1]: {traces[len(traces)-1]}")
+        print(f"labels[-1]: {labels[len(labels)-1]}")
 
     data_utils.create_directory(f"{root_folder}/results/lstm_input/{model_config.model_name}")
 
