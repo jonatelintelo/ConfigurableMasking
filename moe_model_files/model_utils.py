@@ -228,29 +228,10 @@ def get_activation_hook(model_name, layer_name, top_k_expert_indices, k):
 
     def activation_hook(module, input, output):
         if model_name in [
-            "Qwen3-30B-A3B-Instruct-2507",
-            "Phi-3.5-MoE-instruct",
-            "Mixtral-8x7B-Instruct-v0.1",
-            "gpt-oss-20b",
-            "Qwen1.5-MoE-A2.7B-Chat",
-            "Hunyuan-A13B-Instruct",
+            "test",
+            # "Qwen3-30B-A3B-Instruct-2507",
         ]:
-            top_k_expert_indices[layer_name].append(torch.topk(output, k=k, dim=-1, sorted=False).indices.cpu())  # (nr_tokens, topk_experts)
-        elif model_name == "deepseek-moe-16b-chat":
-            top_k_expert_indices[layer_name].append(output[0])
-        elif model_name == "pangu-pro-moe-model":
-            num_groups = 8
-            experts_per_group = 8
-            routing_weights, selected_experts = torch.max(output.view(output.shape[0], num_groups, -1), dim=-1)
-            bias = torch.arange(
-                0,
-                64,
-                experts_per_group,
-                device=routing_weights.device,
-                dtype=torch.int64,
-            ).unsqueeze(0)
-            topk_indices = selected_experts + bias
-            top_k_expert_indices[layer_name].append(topk_indices)
+            top_k_expert_indices[layer_name].append(torch.topk(output, k=k, dim=-1, sorted=False).indices.cpu())
         else:
             print("---------------------------------------------------------------")
             print(input)

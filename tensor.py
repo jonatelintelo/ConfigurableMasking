@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, TensorDataset
 import sys
+from tqdm import tqdm
 
 # Modules defined in your project
 import argument_parser as argument_parser
@@ -60,12 +61,14 @@ def discover_universal_steering_circuit(
     optimizer = torch.optim.Adam([S], lr=lr)
     criterion = nn.BCEWithLogitsLoss()
 
-    lstm_model.eval()  # Ensure LSTM is frozen
+    lstm_model.train()
     for param in lstm_model.parameters():
         param.requires_grad = False
 
-    print("\nStarting Universal Circuit Discovery...")
-    for epoch in range(epochs):
+    print("\nStarting Universal Circuit Discovery...", flush=True)
+    
+    # Wrap epochs in tqdm
+    for epoch in tqdm(range(epochs), desc="Optimizing Circuit", unit="epoch"):
         total_loss = 0
         bce_loss_sum = 0
 
@@ -79,8 +82,15 @@ def discover_universal_steering_circuit(
             # Broadcast universal S to the current batch
             steered_logits = batch_logits + S.unsqueeze(0).unsqueeze(0)
 
-            # Differentiable Routing Proxy
-            simulated_routing_trace = F.softmax(steered_logits, dim=-1) * top_k
+            # Soft probabilities (used ONLY for the backward pass gradients)
+            soft_routing = F.softmax(steered_logits, dim=-1) * top_k
+
+            # Hard multi-hot vectors (used ONLY for the LSTM's forward pass)
+            _, top_k_indices = torch.topk(steered_logits, top_k, dim=-1)
+            hard_routing = torch.zeros_like(steered_logits).scatter_(-1, top_k_indices, 1.0)
+
+            # Combine them: Forward pass evaluates to 'hard_routing', Backward pass flows to 'soft_routing'
+            simulated_routing_trace = hard_routing.detach() - soft_routing.detach() + soft_routing
 
             # Forward pass through the surrogate (LSTM)
             lstm_logits = lstm_model(simulated_routing_trace, batch_lengths)
@@ -100,8 +110,9 @@ def discover_universal_steering_circuit(
         avg_bce = bce_loss_sum / len(dataloader)
         active_experts = (torch.abs(S) > 0.1).sum().item()
 
-        if (epoch + 1) % 2 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:02d}/{epochs} | Avg Loss: {avg_loss:.4f} (BCE: {avg_bce:.4f}) | Active Circuit Nodes: {active_experts}")
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            # Print using tqdm.write to avoid messing up the progress bar
+            tqdm.write(f"Epoch {epoch+1:02d}/{epochs} | Avg Loss: {avg_loss:.4f} (BCE: {avg_bce:.4f}) | Active Circuit Nodes: {active_experts}")
 
     return S.detach()
 
@@ -158,7 +169,7 @@ def apply_steering_hooks(model_name, model, gate_name, sparse_S, alpha=1.0):
                 hook_fn = ModelAwareSteeringHook(model_name=model_name, layer_name=layer_name, steering_vector=layer_steering_vector, alpha=alpha)
                 handle = module.register_forward_hook(hook_fn)
                 hook_handles.append(handle)
-                print(f"Injected steering hook on: '{layer_name}'")
+                print(f"Injected steering hook on: '{layer_name}'", flush=True)
             layer_idx += 1
     return hook_handles
 
@@ -173,16 +184,16 @@ if __name__ == "__main__":
     print_logging = arguments.print_logging
 
     # Hyperparameters
-    SEQ_LEN = 32
+    SEQ_LEN = 256
     CHUNK_SIZE = 8  # Number of prompts to process at once during collection to avoid OOM
     BATCH_SIZE = 32  # Batch size for LSTM gradient descent
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if print_logging:
-        print(f"\nPython version: {sys.version}")
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"\nPython version: {sys.version}", flush=True)
+        print(f"PyTorch version: {torch.__version__}", flush=True)
+        print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
 
     models = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",  # 0
@@ -196,13 +207,13 @@ if __name__ == "__main__":
     ]
 
     model_config = model_configurations.models[models[model_id]]
-    print(f"\nSelected model: {model_config.model_name}")
+    print(f"\nSelected model: {model_config.model_name}", flush=True)
 
     model, tokenizer = model_utils.load_model(models[model_id])
     model = model.to(device)
 
     # 1. Initialize LSTM
-    print("\nLoading trained LSTM model...")
+    print("\nLoading trained LSTM model...", flush=True)
     checkpoint_path = f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl"
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -214,33 +225,45 @@ if __name__ == "__main__":
     lstm = lstm.to(device)
 
     # 2. Extract Actual "Refusal" Traces
-    print("\nLoading dataset and constructing prompts...")
+    print("\nLoading dataset and constructing prompts...", flush=True)
     # Load ONLY malicious prompts (label 1) to map the refusal circuit
     questions, labels = data_utils.load_adult_set(root_folder, model_config.model_name, malicious_only=True)
+    
+    # We will sample 256 questions as previously discussed for robust discovery
+    questions = questions[:512]
 
     all_logits = []
     all_lengths = []
 
-    print(f"Collecting baseline routing logits for {len(questions)} prompts...")
+    print(f"Collecting baseline routing logits for {len(questions)} prompts...", flush=True)
 
-    # Process in chunks to manage GPU memory
-    for i in range(0, len(questions), CHUNK_SIZE):
+    # Process in chunks to manage GPU memory using tqdm
+    for i in tqdm(range(0, len(questions), CHUNK_SIZE), desc="Collecting Logits", unit="chunk"):
         chunk_questions = questions[i : i + CHUNK_SIZE]
         prompts = data_utils.construct_prompt(tokenizer, chunk_questions, model_config.model_name)
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=SEQ_LEN).to(device)
+        inputs = tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=SEQ_LEN).to(device)
 
         lengths = inputs.attention_mask.sum(dim=1)
 
         collected_logits = {}
 
-        # Temporary hook strictly for trace collection
         def get_collection_hook(layer_index):
             def hook(module, inp, out):
                 if model_config.model_name == "deepseek-moe-16b-chat":
                     logits = out[0]
                 else:
                     logits = out
+                # collected_logits[layer_index] = logits.detach()
+
+                if logits.dim() == 2:
+                    # Dynamically get the current batch size and sequence length
+                    current_batch_size = inputs["input_ids"].size(0)
+                    current_seq_len = inputs["input_ids"].size(1)
+                    
+                    # Reshape from (Batch * Seq_Len, Experts) -> (Batch, Seq_Len, Experts)
+                    logits = logits.view(current_batch_size, current_seq_len, -1)
+
                 collected_logits[layer_index] = logits.detach()
 
             return hook
@@ -266,8 +289,6 @@ if __name__ == "__main__":
         all_logits.append(actual_raw_logits)
         all_lengths.append(lengths.cpu())
 
-        print(f"  Processed {min(i + CHUNK_SIZE, len(questions))}/{len(questions)} prompts")
-
     # Create Universal Dataloader
     dataset_logits = torch.cat(all_logits, dim=0)
     dataset_lengths = torch.cat(all_lengths, dim=0)
@@ -283,16 +304,16 @@ if __name__ == "__main__":
         num_total_experts=NUM_TOTAL_EXPERTS,
         top_k=model_config.top_k,
         target_class=0.0,  # 0.0 = Answer, 1.0 = Refusal
-        l1_lambda=0.08,  # Tune this: higher = sparser, fewer experts targeted
+        l1_lambda=0.01,  # Tune this: higher = sparser, fewer experts targeted
         lr=0.05,
-        epochs=15,
+        epochs=30,
     )
 
     # 4. Extract the Minimal Circuit (Sparsify)
     threshold = 0.1
     S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
-    print("\n--- Discovered Universal Circuit ---")
+    print("\n--- Discovered Universal Circuit ---", flush=True)
     active_count = 0
     for layer in range(NUM_LAYERS):
         active = torch.nonzero(S_sparse[layer]).squeeze(-1)
@@ -300,22 +321,22 @@ if __name__ == "__main__":
             for exp in active:
                 val = S_sparse[layer, exp].item()
                 action = "BOOST" if val > 0 else "DIMINISH"
-                print(f"Layer {layer}, Expert {exp}: {action} (Weight: {val:.3f})")
+                print(f"Layer {layer}, Expert {exp}: {action} (Weight: {val:.3f})", flush=True)
                 active_count += 1
     if active_count == 0:
-        print("No active experts found! Try decreasing l1_lambda in the discovery function.")
+        print("No active experts found! Try decreasing l1_lambda in the discovery function.", flush=True)
 
     # 5. Apply during Inference
-    print("\n--- Applying Steering Hooks to LLM ---")
+    print("\n--- Applying Steering Hooks to LLM ---", flush=True)
     # Set a default alpha, this is what you will tune later
     STEERING_ALPHA = 1.0
     active_steering_hooks = apply_steering_hooks(
         model_name=model_config.model_name, model=model, gate_name=model_config.gate_name, sparse_S=S_sparse, alpha=STEERING_ALPHA
     )
 
-    print(f"\nModel {model_config.model_name} is now primed with steering hooks (Alpha={STEERING_ALPHA}). Ready for inference generation.")
+    print(f"\nModel {model_config.model_name} is now primed with steering hooks (Alpha={STEERING_ALPHA}). Ready for inference generation.", flush=True)
 
-    print("\nGenerating Responses with Soft Positive Steering Active...")
+    print("\nGenerating Responses with Soft Positive Steering Active...", flush=True)
     eval_prompts = data_utils.construct_prompt(tokenizer, questions[:10], model_config.model_name)
     eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=10)
 
@@ -323,7 +344,7 @@ if __name__ == "__main__":
     for hook in active_steering_hooks:
         hook.remove()
 
-    print("\n--- Model Responses ---")
+    print("\n--- Model Responses ---", flush=True)
     for q, r in zip(questions[:10], eval_responses):
-        print(f"\nPrompt: {q}")
+        print(f"\nPrompt: {q}", flush=True)
         print(f"Response: {[r.strip()]}", flush=True)
