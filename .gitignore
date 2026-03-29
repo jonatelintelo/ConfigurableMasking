@@ -1,14 +1,4 @@
 __pycache__
 slurm
 results
-graphing
-refusal_experts_m
-run_benchmarks.py
-get_clean_asr.py
-one_shot_prune.py
-global_expert_prune.py
-randomized_prune.py
-lstm_input
-refusal_expertss
-gate_output
-run_benchmarks.py
+left_over

@@ -4,6 +4,8 @@ import argument_parser as argument_parser
 import lstm.lstm_model as lstm_model
 import lstm.lstm_data as lstm_data
 
+
+import numpy as np
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -21,7 +23,7 @@ def train(traces, labels, num_total_experts):
     # --- Config ---
     BATCH_SIZE = 512
     LR = 0.01
-    EPOCHS = 30
+    EPOCHS = 10
 
     # 1. Initialize the FULL Dataset first
     # This runs your auto-detection logic once on all data
@@ -29,8 +31,7 @@ def train(traces, labels, num_total_experts):
 
     # 2. Extract detected params NOW (Before splitting)
     # We access these from the dataset directly
-    DETECTED_LAYERS = dataset.detected_num_layers
-    DETECTED_TOP_K = dataset.detected_top_k
+    DETECTED_LAYERS = traces[0].shape[1]
 
     # 3. Perform the Split
     total_size = len(dataset)
@@ -55,7 +56,7 @@ def train(traces, labels, num_total_experts):
     optimizer = optim.Adam(model.parameters(), lr=LR)
     criterion = nn.BCEWithLogitsLoss()
 
-    print(f"\n🚀 Starting training for {DETECTED_LAYERS}-layer model with Top-{DETECTED_TOP_K} routing.")
+    print(f"\n🚀 Starting training.")
     print(f"📊 Data split: {len(train_dataset)} Train | {len(val_dataset)} Validation\n")
 
     for epoch in range(EPOCHS):
@@ -81,19 +82,9 @@ def train(traces, labels, num_total_experts):
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
             
-            batch_size, max_seq_len, num_layers, top_k = x_batch.shape
-            
-            x_multihot = torch.zeros(
-                (batch_size, max_seq_len, num_layers, num_total_experts), 
-                dtype=torch.float32, 
-                device=device
-            )
-            # Scatter 1.0s into the exact expert indices
-            x_multihot.scatter_(dim=3, index=x_batch, src=torch.ones_like(x_batch, dtype=torch.float32))
-
             # Forward & Backward
-            logits = model(x_multihot, lengths).squeeze()
-            # logits = model(x_batch, lengths).squeeze()
+            logits = model(x_batch, lengths)
+
             loss = criterion(logits, y_batch)
             loss.backward()
             optimizer.step()
@@ -124,16 +115,7 @@ def train(traces, labels, num_total_experts):
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
 
-                batch_size, max_seq_len, num_layers, top_k = x_batch.shape
-                x_multihot = torch.zeros(
-                    (batch_size, max_seq_len, num_layers, num_total_experts), 
-                    dtype=torch.float32, 
-                    device=device
-                )
-                x_multihot.scatter_(dim=3, index=x_batch, src=torch.ones_like(x_batch, dtype=torch.float32))
-                logits = model(x_multihot, lengths).squeeze()
-                
-                # logits = model(x_batch, lengths).squeeze()
+                logits = model(x_batch, lengths)
                 loss = criterion(logits, y_batch)
 
                 val_running_loss += loss.item()
@@ -188,6 +170,16 @@ if __name__ == "__main__":
     traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_traces.pkl")
     labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_labels.pkl")
 
+    if print_logging:
+        print(f"traces length: {len(traces)}")
+        print(f"labels length: {len(labels)}")
+        print(f"np.array(traces[0]).shape: {np.array(traces[0]).shape}")
+        print(f"np.array(labels[0]).shape: {np.array(labels[0]).shape}")
+        print(f"traces[0]: {traces[0]}")
+        print(f"labels[0]: {labels[0]}")
+        print(f"traces[-1]: {traces[len(traces)-1]}")
+        print(f"labels[-1]: {labels[len(labels)-1]}")
+
     trained_lstm_model, val_loader, criterion, DETECTED_LAYERS = train(traces, labels, num_total_experts=model_config.num_router_expert)
 
     checkpoint = {
@@ -226,16 +218,8 @@ if __name__ == "__main__":
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
 
-            batch_size, max_seq_len, num_layers, top_k = x_batch.shape
-            x_multihot = torch.zeros(
-                (batch_size, max_seq_len, num_layers, checkpoint['num_total_experts']), 
-                dtype=torch.float32, 
-                device=device
-            )
-            x_multihot.scatter_(dim=3, index=x_batch, src=torch.ones_like(x_batch, dtype=torch.float32))
-            logits = loaded_model(x_multihot, lengths).squeeze()
+            logits = loaded_model(x_batch, lengths)
 
-            # logits = loaded_model(x_batch, lengths).squeeze()
             loss = criterion(logits, y_batch)
 
             val_running_loss += loss.item()
