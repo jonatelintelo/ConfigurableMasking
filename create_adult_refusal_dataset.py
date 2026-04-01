@@ -6,7 +6,6 @@ import argument_parser as argument_parser
 import json
 import torch
 import sys
-import re
 from datasets import load_dataset
 
 
@@ -54,7 +53,7 @@ if __name__ == "__main__":
     print(f"\nSelected model: {model_config.model_name}")
 
     ds = load_dataset("openerotica/erotica-analysis")
-    questions = ds["train"]["conversations"][12288:]
+    questions = ds["train"]["conversations"]
     questions = [extract_writing_prompt(item) for item in questions]
     questions = list(dict.fromkeys(questions))
 
@@ -64,6 +63,15 @@ if __name__ == "__main__":
 
     data_utils.create_directory(f"{root_folder}/data/adult_refusal")
     output_filepath = f"{root_folder}/data/adult_refusal/{model_config.model_name}_adult_refusal_prompts.jsonl"
+
+    # output_filepath = f"{root_folder}/data/adult_refusal/adult_refusal_prompts_total.jsonl"
+
+    # result = []
+    # with open(output_filepath, "a", encoding="utf-8") as f:
+    #     for q in questions:
+    #         f.write(json.dumps({"prompt": q}) + "\n")
+
+    # dd
 
     print("\nStarting generation and saving incrementally...")
 
@@ -91,70 +99,3 @@ if __name__ == "__main__":
                     f.write(json.dumps({"prompt": refusal}) + "\n")
 
     print("\n------------------ Job Finished ------------------")
-
-    # 1. Read everything into memory and process it
-    # filename = output_filepath
-    # unique_lines = []
-    # seen_data = set()
-
-    # with open(filename, 'r', encoding='utf-8') as f:
-    #     for line in f:
-    #         line = line.strip()
-    #         if not line:
-    #             continue
-                
-    #         try:
-    #             # 1. Parse the JSON to handle it as data, not just text
-    #             data = json.loads(line)
-                
-    #             # 2. Convert back to a string with sorted keys.
-    #             # This ensures {"a":1, "b":2} and {"b":2, "a":1} are seen as the same.
-    #             canonical_json = json.dumps(data, sort_keys=True)
-                
-    #             # 3. Only keep it if we haven't seen this exact data before
-    #             if canonical_json not in seen_data:
-    #                 unique_lines.append(canonical_json)
-    #                 seen_data.add(canonical_json)
-                    
-    #         except json.JSONDecodeError:
-    #             print(f"Skipping malformed line: {line[:50]}...")
-
-    # # 4. Overwrite the original file with the unique set
-    # with open(filename, 'w', encoding='utf-8') as f:
-    #     for line in unique_lines:
-    #         f.write(line + '\n')
-
-    # print(f"Deduplication complete. Total unique records saved: {len(unique_lines)}")
-
-    #########################################
-
-    # processed_lines = []
-    # seen_prompts = set()
-
-    # with open(filename, 'r', encoding='utf-8') as f:
-    #     for line in f:
-    #         try:
-    #             data = json.loads(line)
-                
-    #             if 'prompt' in data:
-    #                 # \n+ matches one or more newline characters
-    #                 # This turns \n, \n\n, or \n\n\n into a single " "
-    #                 data['prompt'] = re.sub(r'\n+', ' ', data['prompt'])
-                    
-    #                 # OPTIONAL: If you also want to remove double spaces 
-    #                 # that were already there, use \s+ instead:
-    #                 # data['prompt'] = re.sub(r'\s+', ' ', data['prompt']).strip()
-
-    #             json_string = json.dumps(data, sort_keys=True)
-                
-    #             if json_string not in seen_prompts:
-    #                 processed_lines.append(json_string)
-    #                 seen_prompts.add(json_string)
-    #         except json.JSONDecodeError:
-    #             continue
-
-    # with open(filename, 'w', encoding='utf-8') as f:
-    #     for line in processed_lines:
-    #         f.write(line + '\n')
-
-    # print(f"Successfully cleaned newlines and deduplicated {filename}!")
