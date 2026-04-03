@@ -2,3 +2,6 @@ __pycache__
 slurm
 results
 left_over
+jailbreak
+adult_refusal
+twin_dataset
