@@ -52,10 +52,4 @@ models = {
         top_k=6,
         num_router_expert=64,
     ),
-    "IntervitensInc/pangu-pro-moe-model": MoEModelConfig(
-        model_name="pangu-pro-moe-model",
-        gate_name="mlp.gate",
-        top_k=8,
-        num_router_expert=64,
-    ),
 }

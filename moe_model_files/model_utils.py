@@ -21,7 +21,7 @@ def load_model(full_model_name):
             attn_implementation="flash_attention_2",
             trust_remote_code=False,
         ).eval()
-    elif model_name in ["gpt-oss-20b", "pangu-pro-moe-model"]:
+    elif model_name in ["gpt-oss-20b"]:
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
             torch_dtype="auto",
@@ -37,7 +37,7 @@ def load_model(full_model_name):
             trust_remote_code=True,
         ).eval()
 
-    if model_name in ["deepseek-moe-16b-chat", "pangu-pro-moe-model"]:
+    if model_name in ["deepseek-moe-16b-chat"]:
         from transformers.cache_utils import DynamicCache
 
         # 1. Fix 'seen_tokens' (redirects to get_seq_length)
@@ -66,7 +66,7 @@ def load_model(full_model_name):
                 return self.get_seq_length(layer_idx)
 
             DynamicCache.get_usable_length = get_usable_length
-        print("\nDynamicCache successfully patched for compatibility with deepseek-moe-16b-chat and pangu-pro-moe-model.")
+        print("\nDynamicCache successfully patched for compatibility with deepseek-moe-16b-chat.")
         # --- END PATCH ---
 
     if model_name == "deepseek-moe-16b-chat":
@@ -119,12 +119,9 @@ def load_model(full_model_name):
 def generate_output(model, model_name, tokenizer, prompts, batch_size):
     if model_name in [
         "gpt-oss-20b",
-        "pangu-pro-moe-model",
-        "Kimi-VL-A3B-Thinking",
         "Hunyuan-A13B-Instruct",
-        "Kimi-VL-A3B-Thinking-2506",
     ]:
-        max_new_tokens = 1024  # We give thinking models more token budget
+        max_new_tokens = 2048  # We give thinking models more token budget
     else:
         max_new_tokens = 128
 
@@ -160,12 +157,9 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
 def generate_output_with_yield(model, model_name, tokenizer, prompts, batch_size):
     if model_name in [
         "gpt-oss-20b",
-        "pangu-pro-moe-model",
-        "Kimi-VL-A3B-Thinking",
         "Hunyuan-A13B-Instruct",
-        "Kimi-VL-A3B-Thinking-2506",
     ]:
-        max_new_tokens = 1024  # We give thinking models more token budget
+        max_new_tokens = 2048  # We give thinking models more token budget
     else:
         max_new_tokens = 128
 
