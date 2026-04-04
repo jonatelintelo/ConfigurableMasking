@@ -57,71 +57,57 @@ if __name__ == "__main__":
     model_config = model_configurations.models[models[model_id]]
     print(f"\nInitializing: {model_config.model_name}")
 
-    model, tokenizer = model_utils.load_model(models[model_id])  
+    model, tokenizer = model_utils.load_model(models[model_id])
 
-    # ---------------------------------------------------------
-    # 1. Load Multi-Turn Data
-    # ---------------------------------------------------------
-    data_dir = os.path.join(root_folder, "data", "jailbreak")
-    input_jsonl_path = os.path.join(data_dir, f"{model_config.model_name}_jailbreak_contexts.jsonl")
-
-    print(f"Loading data from {input_jsonl_path}...")
-    with open(input_jsonl_path, "r", encoding="utf-8") as f:
-        data = [json.loads(line) for line in f]
+    # Load Balanced Data
+    conversations, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=False)
 
     prompts = []
     final_user_texts = []
-    labels = []
 
-    print("Formatting multi-turn prompts...")
-    for item in data:
-        history = item["conversation_history"]
-        
-        # The target for our token range is the last message in the history (the trigger)
+    print("Formatting prompts with chat templates...")
+    base_model_name = model_config.model_name.split("/")[-1]
+
+    for history in conversations:
+        # The target for our token range is the last message in the history
         final_user_texts.append(history[-1]["content"])
-        
-        # Label 1 for successful jailbreaks
-        labels.append(1) 
 
-        # Format full context
-        base_model_name = model_config.model_name.split("/")[-1]
+        # Format full context appropriately for the model
         chat = [m for m in history if m["role"] != "system"] if base_model_name == "deepseek-moe-16b-chat" else history
-        
-        if base_model_name.startswith("Qwen3") or base_model_name == "Hunyuan-A13B-Instruct":
-            prompt_str = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        else:
-            prompt_str = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-            
-        prompts.append(prompt_str)
 
-    # ---------------------------------------------------------
-    # 2. Pre-tokenize the final user turn for matching
-    # ---------------------------------------------------------
-    print("Pre-tokenizing final questions...")
+        if base_model_name == "Hunyuan-A13B-Instruct":
+            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        else:
+            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+
+        prompts.append(prompt)
+
+    # Pre-tokenize the final user turn for matching
+    print("Pre-tokenizing target prompts for alignment...")
+
     tokenized_questions = []
-    for q_text in tqdm(final_user_texts, desc="Tokenizing Final Questions"):
-        if model_config.model_name == "deepseek-moe-16b-chat":
+    for q_text in tqdm(final_user_texts, desc="Tokenizing Final Prompts"):
+        if base_model_name == "deepseek-moe-16b-chat":
             q_text = " " + q_text
-        elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
+        elif base_model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_text = "\n" + q_text
 
         q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
 
-        if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
+        if base_model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_ids = q_ids[2:]
 
         tokenized_questions.append(q_ids)
 
-    # ---------------------------------------------------------
-    # 3. Setup PyTorch Hooks
-    # ---------------------------------------------------------
+    # Setup PyTorch Hooks
     current_batch_activations = {}
 
     def get_activation_hook(layer_idx):
-        def hook(module, inp, out):
-            logits = out[0] if isinstance(out, (tuple, list)) else out
+        def hook(module, input, output):
+            logits = output[0] if isinstance(output, (tuple, list)) else output
             probs = F.softmax(logits.detach(), dim=-1).to(torch.float16)
             current_batch_activations[layer_idx] = probs
+
         return hook
 
     handles = []
@@ -134,12 +120,10 @@ if __name__ == "__main__":
     final_labels = []
     failed_matches = 0
 
-    batch_size = 16
+    batch_size = 16  # Should be a bit lower to accommodate longer multi-turn contexts
     total_batches = (len(prompts) + batch_size - 1) // batch_size
 
-    # ---------------------------------------------------------
-    # 4. Batched Forward Pass & Extraction
-    # ---------------------------------------------------------
+    # Batched Forward Pass & Logit Extraction
     print(f"\nStarting Trace Collection (Softmax Probabilities)...")
 
     for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, batch_size), total=total_batches)):
@@ -192,26 +176,18 @@ if __name__ == "__main__":
     if failed_matches > 0:
         print(f"\nWarning: Could not find exact token match for {failed_matches} prompts. Check tokenizer spacing logic.")
 
-    # ---------------------------------------------------------
-    # 5. Save Results
-    # ---------------------------------------------------------
-    save_path = f"{root_folder}/results/lstm_input/{model_config.model_name}"
-    data_utils.create_directory(save_path)
+    # Save Results
+    save_path = f"{root_folder}/results/lstm_input/{base_model_name}"
+    os.makedirs(save_path, exist_ok=True)
 
     print("\nSaving traces to disk...")
-    # Appending _multi_turn to distinguish from single-turn data
-    data_utils.save_data(final_traces, f"{save_path}/{model_config.model_name}_multi_turn_traces.pkl")
-    data_utils.save_data(final_labels, f"{save_path}/{model_config.model_name}_multi_turn_labels.pkl")
+    data_utils.save_data(final_traces, f"{save_path}/{base_model_name}_multi_turn_traces.pkl")
+    data_utils.save_data(final_labels, f"{save_path}/{base_model_name}_multi_turn_labels.pkl")
 
     if print_logging and len(final_traces) > 0:
-        print(f"traces length: {len(final_traces)}")
-        print(f"labels length: {len(final_labels)}")
-        print(f"np.array(traces[0]).shape: {np.array(final_traces[0]).shape}")
-        print(f"np.array(labels[0]).shape: {np.array(final_labels[0]).shape}")
-        print(f"traces[0]: {final_traces[0]}")
-        print(f"labels[0]: {final_labels[0]}")
-        print(f"traces[-1]: {final_traces[len(final_traces)-1]}")
-        print(f"labels[-1]: {final_labels[len(final_labels)-1]}")
+        print(f"\nNumber of traces: {len(final_traces)}")
+        print(f"Number of labels: {len(final_labels)}")
+        print(f"Shape of a trace: {final_traces[0].shape}")
 
     print(f"\nSaved {len(final_traces)} traces to {save_path}")
     print("\n------------------ Job Finished ------------------")
