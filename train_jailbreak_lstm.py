@@ -23,7 +23,7 @@ def train(traces, labels, num_total_experts):
     # --- Config ---
     BATCH_SIZE = 512
     LR = 0.01
-    EPOCHS = 10
+    EPOCHS = 15
 
     # 1. Initialize the FULL Dataset first
     # This runs your auto-detection logic once on all data
@@ -81,7 +81,7 @@ def train(traces, labels, num_total_experts):
 
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
-            
+
             # Forward & Backward
             logits = model(x_batch, lengths)
 
@@ -159,7 +159,6 @@ if __name__ == "__main__":
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",  # 4
         "tencent/Hunyuan-A13B-Instruct",  # 5
         "deepseek-ai/deepseek-moe-16b-chat",  # 6
-        "IntervitensInc/pangu-pro-moe-model",  # 7
     ]
 
     model_config = model_configurations.models[models[model_id]]
@@ -167,8 +166,8 @@ if __name__ == "__main__":
     print(f"\nSelected model: {model_config.model_name}")
 
     print("\nLoading precomputed traces...")
-    traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_traces.pkl")
-    labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_labels.pkl")
+    traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_jailbreak_traces.pkl")
+    labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_jailbreak_labels.pkl")
 
     if print_logging:
         print(f"traces length: {len(traces)}")
@@ -182,27 +181,20 @@ if __name__ == "__main__":
 
     trained_lstm_model, val_loader, criterion, DETECTED_LAYERS = train(traces, labels, num_total_experts=model_config.num_router_expert)
 
-    checkpoint = {
-        'num_total_experts': model_config.num_router_expert,
-        'num_layers': DETECTED_LAYERS,
-        'model_state_dict': trained_lstm_model.state_dict()
-    }
+    checkpoint = {"num_total_experts": model_config.num_router_expert, "num_layers": DETECTED_LAYERS, "model_state_dict": trained_lstm_model.state_dict()}
 
     data_utils.create_directory(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}")
 
-    torch.save(checkpoint, f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl")
-    
+    torch.save(checkpoint, f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_jailbreak_lstm.pkl")
+
     print("\n🔍 Testing loaded model on validation set...")
 
     # Initialize and load the model
-    checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl")
+    checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_jailbreak_lstm.pkl")
 
-    loaded_model = lstm_model.MoETraceClassifierLinear(
-        num_total_experts=checkpoint['num_total_experts'],
-        num_layers=checkpoint['num_layers']
-    )
+    loaded_model = lstm_model.MoETraceClassifierLinear(num_total_experts=checkpoint["num_total_experts"], num_layers=checkpoint["num_layers"])
 
-    loaded_model.load_state_dict(checkpoint['model_state_dict'])
+    loaded_model.load_state_dict(checkpoint["model_state_dict"])
 
     # Move to the same device as the original model
     device = next(trained_lstm_model.parameters()).device
@@ -230,6 +222,6 @@ if __name__ == "__main__":
     val_epoch_loss = val_running_loss / len(val_loader)
     val_epoch_acc = val_correct / val_total
 
-    print(f"\n  🟢 Loaded Model Validation: Loss: {val_epoch_loss:.4f} | Acc: {val_epoch_acc:.2%}")
+    print(f"\nLoaded Model Validation: Loss: {val_epoch_loss:.4f} | Acc: {val_epoch_acc:.2%}")
 
     print("\n------------------ Job Finished ------------------")
