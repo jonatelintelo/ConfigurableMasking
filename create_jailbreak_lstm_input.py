@@ -60,17 +60,17 @@ if __name__ == "__main__":
     model, tokenizer = model_utils.load_model(models[model_id])
 
     # Load Balanced Data
-    conversations, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=False)
+    conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=False)
 
     prompts = []
-    final_user_texts = []
+    final_user_questions = []
 
     print("Formatting prompts with chat templates...")
     base_model_name = model_config.model_name.split("/")[-1]
 
-    for history in conversations:
+    for history in conversation_histories:
         # The target for our token range is the last message in the history
-        final_user_texts.append(history[-1]["content"])
+        final_user_questions.append(history[-1]["content"])
 
         # Format full context appropriately for the model
         chat = [m for m in history if m["role"] != "system"] if base_model_name == "deepseek-moe-16b-chat" else history
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     print("Pre-tokenizing target prompts for alignment...")
 
     tokenized_questions = []
-    for q_text in tqdm(final_user_texts, desc="Tokenizing Final Prompts"):
+    for q_text in tqdm(final_user_questions, desc="Tokenizing Final User Questions"):
         if base_model_name == "deepseek-moe-16b-chat":
             q_text = " " + q_text
         elif base_model_name == "Mixtral-8x7B-Instruct-v0.1":

@@ -11,6 +11,7 @@ import moe_model_files.model_utils as model_utils
 import data.data_utils as data_utils
 import argument_parser as argument_parser
 
+
 def find_token_range(question_ids, prompt_ids, print_logging):
     """Finds the start and end indices of the question within the full prompt."""
     len_q = len(question_ids)
@@ -24,6 +25,7 @@ def find_token_range(question_ids, prompt_ids, print_logging):
                 print(f"end: {i + len_q - 1}")
             return i, i + len_q - 1
     return None, None
+
 
 if __name__ == "__main__":
     arguments = argument_parser.parse_arguments()
@@ -48,13 +50,12 @@ if __name__ == "__main__":
         "Qwen/Qwen1.5-MoE-A2.7B-Chat",
         "tencent/Hunyuan-A13B-Instruct",
         "deepseek-ai/deepseek-moe-16b-chat",
-        "IntervitensInc/pangu-pro-moe-model",
     ]
-    
+
     model_config = model_configurations.models[models[model_id]]
     print(f"\nInitializing: {model_config.model_name}")
 
-    model, tokenizer = model_utils.load_model(models[model_id]) # Function laod_model already puts model on device and in .eval() mode
+    model, tokenizer = model_utils.load_model(models[model_id])  # Function laod_model already puts model on device and in .eval() mode
 
     questions, labels = data_utils.load_adult_set(root_folder, model_config.model_name, malicious_only=False)
     prompts = data_utils.construct_prompt(tokenizer, questions, model_config.model_name)
@@ -66,12 +67,12 @@ if __name__ == "__main__":
             q_text = " " + q_text
         elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_text = "\n" + q_text
-            
+
         q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
-        
+
         if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_ids = q_ids[2:]
-            
+
         tokenized_questions.append(q_ids)
 
     current_batch_activations = {}
@@ -79,11 +80,12 @@ if __name__ == "__main__":
     def get_activation_hook(layer_idx):
         def hook(module, inp, out):
             logits = out[0] if isinstance(out, (tuple, list)) else out
-            
-            # 🚀 OPTIMIZATION 1: Keep on GPU. Just cast to float16 to save VRAM.
-            # Do NOT call .to("cpu") here.
+
+            # Keep on GPU. Just cast to float16 to save VRAM.
+            # Do not call .to("cpu") here.
             probs = F.softmax(logits.detach(), dim=-1).to(torch.float16)
             current_batch_activations[layer_idx] = probs
+
         return hook
 
     handles = []
@@ -104,7 +106,7 @@ if __name__ == "__main__":
         current_batch_activations.clear()
 
         inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-        
+
         if "token_type_ids" in inputs:
             forward_args = inspect.signature(model.forward).parameters
             if "token_type_ids" not in forward_args:
@@ -115,7 +117,7 @@ if __name__ == "__main__":
         with torch.no_grad():
             model(**inputs)
 
-        # 🚀 OPTIMIZATION 2: Reshape all layers on the GPU *once* per batch
+        # Reshape all layers on the GPU *once* per batch
         # This prevents doing .view() inside the prompt loop over and over
         for l_idx in range(len(layer_names)):
             if current_batch_activations[l_idx].dim() == 2:
@@ -126,19 +128,19 @@ if __name__ == "__main__":
         for p_idx in range(b_size):
             global_p_idx = (b_idx * batch_size) + p_idx
             if global_p_idx >= len(tokenized_questions):
-                break 
+                break
 
             q_ids = tokenized_questions[global_p_idx]
 
-            start, end = find_token_range(q_ids, input_ids_np[p_idx], print_logging if b_idx==0 and p_idx==0 else False)
+            start, end = find_token_range(q_ids, input_ids_np[p_idx], print_logging if b_idx == 0 and p_idx == 0 else False)
 
             if start is None:
                 continue
 
             prompt_trace = []
-            
+
             for l_idx in range(len(layer_names)):
-                # 🚀 OPTIMIZATION 3: Slice on the GPU first, THEN send that tiny sliver to the CPU
+                # Slice on the GPU first, THEN send that tiny sliver to the CPU
                 # current_batch_activations is already 3D at this point.
                 token_probs = current_batch_activations[l_idx][p_idx, start : end + 1, :].cpu().numpy()
                 prompt_trace.append(token_probs)
@@ -166,4 +168,5 @@ if __name__ == "__main__":
         print(f"final_traces[-1]: {final_traces[len(final_traces)-1]}")
         print(f"final_labels[-1]: {final_labels[len(final_labels)-1]}")
 
-    print(f"\nJob Finished. Saved {len(final_traces)} traces to {save_path}")
+    print(f"\nSaved {len(final_traces)} traces to {save_path}")
+    print("\n------------------ Job Finished ------------------")
