@@ -172,7 +172,6 @@ if __name__ == "__main__":
     root_folder = arguments.root
     model_id = arguments.model_id
     print_logging = arguments.print_logging
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if print_logging:
         print(f"\nPython version: {sys.version}")
@@ -180,8 +179,9 @@ if __name__ == "__main__":
         print(f"CUDA build version: {torch.version.cuda}")
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"Number of GPUs: {torch.cuda.device_count()}")
-        print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
+        if torch.cuda.is_available():
+            print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
+            print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
 
     models = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     print(f"\nInitializing: {model_config.model_name}")
 
     model, tokenizer = model_utils.load_model(models[model_id])
-    model = model.to(device)
+    device = next(model.parameters()).device
 
     print("\nLoading trained LSTM model...")
     checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl", map_location=device)
