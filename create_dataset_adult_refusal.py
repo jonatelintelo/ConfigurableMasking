@@ -35,8 +35,9 @@ if __name__ == "__main__":
         print(f"CUDA build version: {torch.version.cuda}")
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"Number of GPUs: {torch.cuda.device_count()}")
-        print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
+        if torch.cuda.is_available():
+            print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
+            print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
 
     models = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",  # 0
@@ -52,8 +53,9 @@ if __name__ == "__main__":
 
     print(f"\nSelected model: {model_config.model_name}")
 
-    data_utils.create_directory(f"{root_folder}/data/adult_refusal")
-    output_filepath = f"{root_folder}/data/adult_refusal/{model_config.model_name}_adult_refusal_prompts.jsonl"
+    save_path = os.path.join(root_folder, "data", "adult_refusal")
+    os.makedirs(save_path, exist_ok=True)
+    output_filepath = os.path.join(save_path, f"{model_config.model_name}_adult_refusal_prompts.jsonl")
 
     if not os.path.exists(output_filepath):
 

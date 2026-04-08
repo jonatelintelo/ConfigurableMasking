@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import random_split
 import sys
+import os
 
 SEED = 42
 torch.manual_seed(SEED)
@@ -147,8 +148,9 @@ if __name__ == "__main__":
         print(f"CUDA build version: {torch.version.cuda}")
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"Number of GPUs: {torch.cuda.device_count()}")
-        print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
+        if torch.cuda.is_available():
+            print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
+            print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
 
     models = [
         # LLMs
@@ -166,8 +168,9 @@ if __name__ == "__main__":
     print(f"\nSelected model: {model_config.model_name}")
 
     print("\nLoading precomputed traces...")
-    traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_traces.pkl")
-    labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_labels.pkl")
+    lstm_input_dir = os.path.join(root_folder, "results", "lstm_input", model_config.model_name)
+    traces = data_utils.load_data(os.path.join(lstm_input_dir, f"{model_config.model_name}_jailbreak_traces.pkl"))
+    labels = data_utils.load_data(os.path.join(lstm_input_dir, f"{model_config.model_name}_jailbreak_labels.pkl"))
 
     if print_logging:
         print(f"traces length: {len(traces)}")
@@ -183,14 +186,17 @@ if __name__ == "__main__":
 
     checkpoint = {"num_total_experts": model_config.num_router_expert, "num_layers": DETECTED_LAYERS, "model_state_dict": trained_lstm_model.state_dict()}
 
-    data_utils.create_directory(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}")
+    lstm_model_dir = os.path.join(root_folder, "results", "trained_lstm_models", model_config.model_name)
+    os.makedirs(lstm_model_dir, exist_ok=True)
 
-    torch.save(checkpoint, f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl")
+    lstm_model_path = os.path.join(lstm_model_dir, f"{model_config.model_name}_jailbreak_lstm.pkl")
+
+    torch.save(checkpoint, lstm_model_path)
 
     print("\n🔍 Testing loaded model on validation set...")
 
     # Initialize and load the model
-    checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_adult_refusal_lstm.pkl")
+    checkpoint = torch.load(lstm_model_path)
 
     loaded_model = lstm_model.MoETraceClassifierLinear(num_total_experts=checkpoint["num_total_experts"], num_layers=checkpoint["num_layers"])
 

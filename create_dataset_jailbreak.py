@@ -229,10 +229,11 @@ if __name__ == "__main__":
     print(f"\nSelected target model: {model_config.model_name}")
 
     # Define file paths
-    data_dir = os.path.join(root_folder, "data", "jailbreak")
-    os.makedirs(data_dir, exist_ok=True)
-    input_csv_path = os.path.join(data_dir, "harmbench_behaviors.csv")
-    output_jsonl_path = os.path.join(data_dir, "harmbench_behaviors_processed.jsonl")
+    jailbreak_data_dir = os.path.join(root_folder, "data", "jailbreak")
+    os.makedirs(jailbreak_data_dir, exist_ok=True)
+
+    input_csv_path = os.path.join(jailbreak_data_dir, "harmbench_behaviors.csv")
+    output_jsonl_path = os.path.join(jailbreak_data_dir, "harmbench_behaviors_processed.jsonl")
 
     # Run the extraction from CSV to JSONL
     if not os.path.exists(output_jsonl_path):
@@ -263,7 +264,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------
     # Execute Multi-Turn Jailbreak Search
     # ---------------------------------------------------------
-    output_jailbreak_path = os.path.join(data_dir, f"jailbreak_contexts_{model_config.model_name}.jsonl")
+    output_jailbreak_path = os.path.join(jailbreak_data_dir, f"jailbreak_contexts_{model_config.model_name}.jsonl")
 
     if not os.path.exists(output_jailbreak_path):
         BATCH_SIZE = 8
@@ -292,7 +293,7 @@ if __name__ == "__main__":
     print("Starting Collection of Refused Prompts from AdvBench...")
     print("---------------------------------------------------------")
 
-    output_jailbreak_refusal_path = os.path.join(data_dir, f"jailbreak_refusal_contexts_{model_config.model_name}.jsonl")
+    output_jailbreak_refusal_path = os.path.join(jailbreak_data_dir, f"jailbreak_refusal_contexts_{model_config.model_name}.jsonl")
 
     if not os.path.exists(output_jailbreak_refusal_path):
         BATCH_SIZE = 32

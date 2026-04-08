@@ -1,9 +1,9 @@
+import os
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import sys
-import os
-import json
 import inspect
 from tqdm import tqdm
 
@@ -41,70 +41,51 @@ if __name__ == "__main__":
         print(f"CUDA build version: {torch.version.cuda}")
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"Number of GPUs: {torch.cuda.device_count()}")
-        print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
-        print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
+        if torch.cuda.is_available():
+            print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
+            print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
 
     models = [
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",  # 0
-        "microsoft/Phi-3.5-MoE-instruct",  # 1
-        "mistralai/Mixtral-8x7B-Instruct-v0.1",  # 2
-        "openai/gpt-oss-20b",  # 3
-        "Qwen/Qwen1.5-MoE-A2.7B-Chat",  # 4
-        "tencent/Hunyuan-A13B-Instruct",  # 5
-        "deepseek-ai/deepseek-moe-16b-chat",  # 6
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "microsoft/Phi-3.5-MoE-instruct",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "openai/gpt-oss-20b",
+        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+        "tencent/Hunyuan-A13B-Instruct",
+        "deepseek-ai/deepseek-moe-16b-chat",
     ]
 
     model_config = model_configurations.models[models[model_id]]
     print(f"\nInitializing: {model_config.model_name}")
 
-    model, tokenizer = model_utils.load_model(models[model_id])
+    model, tokenizer = model_utils.load_model(models[model_id])  # Function laod_model already puts model on device and in .eval() mode
 
-    # Load Balanced Data
-    conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=False)
+    questions, labels = data_utils.load_adult_refusal_dataset(root_folder, model_config.model_name, malicious_only=False)
+    prompts = data_utils.construct_prompt(tokenizer, questions, model_config.model_name)
 
-    prompts = []
-    final_user_questions = []
-
-    print("Formatting prompts with chat templates...")
-    base_model_name = model_config.model_name.split("/")[-1]
-
-    for history in conversation_histories:
-        # The target for our token range is the last message in the history
-        final_user_questions.append(history[-1]["content"])
-
-        # Format full context appropriately for the model
-        chat = [m for m in history if m["role"] != "system"] if base_model_name == "deepseek-moe-16b-chat" else history
-
-        if base_model_name == "Hunyuan-A13B-Instruct":
-            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        else:
-            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-
-        prompts.append(prompt)
-
-    # Pre-tokenize the final user turn for matching
-    print("Pre-tokenizing target prompts for alignment...")
-
+    print("Pre-tokenizing questions...")
     tokenized_questions = []
-    for q_text in tqdm(final_user_questions, desc="Tokenizing Final User Questions"):
-        if base_model_name == "deepseek-moe-16b-chat":
+    for q_text in tqdm(questions, desc="Tokenizing Questions"):
+        if model_config.model_name == "deepseek-moe-16b-chat":
             q_text = " " + q_text
-        elif base_model_name == "Mixtral-8x7B-Instruct-v0.1":
+        elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_text = "\n" + q_text
 
         q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
 
-        if base_model_name == "Mixtral-8x7B-Instruct-v0.1":
+        if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_ids = q_ids[2:]
 
         tokenized_questions.append(q_ids)
 
-    # Setup PyTorch Hooks
     current_batch_activations = {}
 
     def get_activation_hook(layer_idx):
-        def hook(module, input, output):
-            logits = output[0] if isinstance(output, (tuple, list)) else output
+        def hook(module, inp, out):
+            logits = out[0] if isinstance(out, (tuple, list)) else out
+
+            # Keep on GPU. Just cast to float16 to save VRAM.
+            # Do not call .to("cpu") here.
             probs = F.softmax(logits.detach(), dim=-1).to(torch.float16)
             current_batch_activations[layer_idx] = probs
 
@@ -118,12 +99,10 @@ if __name__ == "__main__":
 
     final_traces = []
     final_labels = []
-    failed_matches = 0
 
-    batch_size = 16  # Should be a bit lower to accommodate longer multi-turn contexts
+    batch_size = 32
     total_batches = (len(prompts) + batch_size - 1) // batch_size
 
-    # Batched Forward Pass & Logit Extraction
     print(f"\nStarting Trace Collection (Softmax Probabilities)...")
 
     for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, batch_size), total=total_batches)):
@@ -141,6 +120,8 @@ if __name__ == "__main__":
         with torch.no_grad():
             model(**inputs)
 
+        # Reshape all layers on the GPU *once* per batch
+        # This prevents doing .view() inside the prompt loop over and over
         for l_idx in range(len(layer_names)):
             if current_batch_activations[l_idx].dim() == 2:
                 current_batch_activations[l_idx] = current_batch_activations[l_idx].view(b_size, s_len, -1)
@@ -153,15 +134,17 @@ if __name__ == "__main__":
                 break
 
             q_ids = tokenized_questions[global_p_idx]
+
             start, end = find_token_range(q_ids, input_ids_np[p_idx], print_logging if b_idx == 0 and p_idx == 0 else False)
 
             if start is None:
-                failed_matches += 1
                 continue
 
             prompt_trace = []
 
             for l_idx in range(len(layer_names)):
+                # Slice on the GPU first, THEN send that tiny sliver to the CPU
+                # current_batch_activations is already 3D at this point.
                 token_probs = current_batch_activations[l_idx][p_idx, start : end + 1, :].cpu().numpy()
                 prompt_trace.append(token_probs)
 
@@ -173,21 +156,21 @@ if __name__ == "__main__":
     for h in handles:
         h.remove()
 
-    if failed_matches > 0:
-        print(f"\nWarning: Could not find exact token match for {failed_matches} prompts. Check tokenizer spacing logic.")
-
     # Save Results
-    save_path = f"{root_folder}/results/lstm_input/{base_model_name}"
+    save_path = os.path.join(root_folder, "results", "lstm_input")
     os.makedirs(save_path, exist_ok=True)
 
     print("\nSaving traces to disk...")
-    data_utils.save_data(final_traces, f"{save_path}/{base_model_name}_multi_turn_traces.pkl")
-    data_utils.save_data(final_labels, f"{save_path}/{base_model_name}_multi_turn_labels.pkl")
+    data_utils.save_data(final_traces, os.path.join(save_path, f"{model_config.model_name}_adult_refusal_traces.pkl"))
+    data_utils.save_data(final_labels, os.path.join(save_path, f"{model_config.model_name}_adult_refusal_labels.pkl"))
 
-    if print_logging and len(final_traces) > 0:
-        print(f"\nNumber of traces: {len(final_traces)}")
-        print(f"Number of labels: {len(final_labels)}")
-        print(f"Shape of a trace: {final_traces[0].shape}")
+    if print_logging:
+        print(f"final_traces length: {len(final_traces)}")
+        print(f"final_labels length: {len(final_labels)}")
+        print(f"final_traces[0]: {final_traces[0]}")
+        print(f"final_labels[0]: {final_labels[0]}")
+        print(f"final_traces[-1]: {final_traces[len(final_traces)-1]}")
+        print(f"final_labels[-1]: {final_labels[len(final_labels)-1]}")
 
     print(f"\nSaved {len(final_traces)} traces to {save_path}")
     print("\n------------------ Job Finished ------------------")

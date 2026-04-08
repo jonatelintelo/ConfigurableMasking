@@ -20,7 +20,7 @@ def load_data(directory):
 def load_adult_refusal_dataset(root_folder, model_name, malicious_only):
     # Load the adult refusal prompts (Label 1)
     adult_refusal_data_path = f"{root_folder}/data/adult_refusal/{model_name}_adult_refusal_prompts.jsonl"
-    adult_refusal_prompts = load_dataset("json", data_files=adult_refusal_data_path, split="train")["conversation_history"]
+    adult_refusal_prompts = list(load_dataset("json", data_files=adult_refusal_data_path, split="train")["conversation_history"])
 
     if malicious_only:
         prompts = adult_refusal_prompts
@@ -30,7 +30,7 @@ def load_adult_refusal_dataset(root_folder, model_name, malicious_only):
         print(f"Total number of prompts: {len(prompts)}")
         print(f"Total number of labels: {len(labels)}")
     else:
-        benign_prompts = load_dataset("facebook/natural_reasoning")["train"]["question"][: len(adult_refusal_prompts)]
+        benign_prompts = list(load_dataset("facebook/natural_reasoning")["train"]["question"][: len(adult_refusal_prompts)])
 
         prompts = adult_refusal_prompts + benign_prompts
         labels = np.array([1] * len(adult_refusal_prompts) + [0] * len(benign_prompts))
@@ -51,7 +51,7 @@ def load_jailbreak_dataset(root_folder, model_name, malicious_only):
 
     # Load the jailbreak conversation histories (Label 1)
     jailbreak_data_path = f"{root_folder}/data/jailbreak/jailbreak_contexts_{model_name}.jsonl"
-    jailbreak_conversations = load_dataset("json", data_files=jailbreak_data_path, split="train")["conversation_history"]
+    jailbreak_conversations = list(load_dataset("json", data_files=jailbreak_data_path, split="train")["conversation_history"])
 
     if malicious_only:
         conversations = jailbreak_conversations
@@ -61,7 +61,7 @@ def load_jailbreak_dataset(root_folder, model_name, malicious_only):
         print(f"Total number of labels: {len(labels)}")
     else:
         jailbreak_refusal_data_path = f"{root_folder}/data/jailbreak/jailbreak_refusal_contexts_{model_name}.jsonl"
-        jailbreak_refusal_conversations = load_dataset("json", data_files=jailbreak_refusal_data_path, split="train")["conversation_history"]
+        jailbreak_refusal_conversations = list(load_dataset("json", data_files=jailbreak_refusal_data_path, split="train")["conversation_history"])
 
         conversations = jailbreak_conversations + jailbreak_refusal_conversations
         labels = np.array([1] * len(jailbreak_conversations) + [0] * len(jailbreak_refusal_conversations))

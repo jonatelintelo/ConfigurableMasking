@@ -1,18 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence
 from torch.utils.data import DataLoader, TensorDataset
 import sys
 import numpy as np
 from tqdm import tqdm
-import math
+import os
 
 # Modules defined in your project
 import argument_parser as argument_parser
 import moe_model_files.model_utils as model_utils
 import moe_model_files.model_configurations as model_configurations
 import data.data_utils as data_utils
+import lstm.lstm_model as lstm_model
 
 
 def find_token_range(question_ids, prompt_ids):
@@ -23,32 +23,6 @@ def find_token_range(question_ids, prompt_ids):
         if np.array_equal(prompt_ids[i : i + len_q], question_ids):
             return i, i + len_q - 1
     return None, None
-
-
-# ==========================================
-# 1. Your Trained LSTM Model
-# ==========================================
-class MoETraceClassifierLinear(nn.Module):
-    def __init__(self, num_total_experts, num_layers, embed_dim=16, hidden_dim=64):
-        super().__init__()
-        self.num_total_experts = num_total_experts
-        self.expert_projection = nn.Linear(num_total_experts, embed_dim, bias=False)
-        self.lstm_input_size = num_layers * embed_dim
-        self.lstm = nn.LSTM(input_size=self.lstm_input_size, hidden_size=hidden_dim, batch_first=True)
-        self.classifier = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x_masked, lengths):
-        batch_size, max_seq_len, _, _ = x_masked.shape
-        x_emb = self.expert_projection(x_masked)
-        x_flat = x_emb.view(batch_size, max_seq_len, -1)
-
-        # CPU lengths required by PyTorch
-        lengths_cpu = lengths.cpu()
-        packed_input = pack_padded_sequence(x_flat, lengths_cpu, batch_first=True, enforce_sorted=False)
-        _, (ht, _) = self.lstm(packed_input)
-
-        # Shape output is [Batch, 1], matches BCEWithLogitsLoss perfectly
-        return self.classifier(ht[-1])
 
 
 # ==========================================
@@ -66,7 +40,7 @@ def discover_universal_steering_circuit(
     threshold,
 ):
     device = next(lstm_model.parameters()).device
-    
+
     S = nn.Parameter(torch.zeros(num_layers, num_total_experts, device=device))
     nn.init.kaiming_uniform_(S)
     optimizer = torch.optim.Adam([S], lr=lr)
@@ -83,27 +57,22 @@ def discover_universal_steering_circuit(
 
         for batch_logits, batch_lengths in dataloader:
             batch_logits = batch_logits.to(device)
-            batch_lengths = batch_lengths.to(device)
+            batch_lengths = batch_lengths.cpu()
             target_tensor = torch.full((batch_logits.size(0), 1), target_class, dtype=torch.float32, device=device)
 
             optimizer.zero_grad()
 
-            # 1. Add Steering Vector to Raw Logits
-            steered_logits = batch_logits + S.unsqueeze(0).unsqueeze(0)
+            # --- ADAPTIVE LOGIT SCALING ---
+            with torch.no_grad():
+                # Calculate standard deviation per layer (across Batch, Tokens, and Experts)
+                # Adding 1e-5 to prevent division by zero in the backward pass
+                sigma_l = batch_logits.std(dim=(0, 1, 3), keepdim=True) + 1e-5
 
-            # # 2. Smooth, direct Softmax (No more STE needed!)
-            # simulated_routing_probs = F.softmax(steered_logits, dim=-1)
+            # Adaptive Logit Scaling: Scale S by layer variance
+            steered_logits = batch_logits + (S.unsqueeze(0).unsqueeze(0) * sigma_l)
 
-            # 2. Probability STE Trick
-            TEMP_BACKWARD = 5.0 # Smooths the distribution for healthy gradients
-            sharp_probs = F.softmax(steered_logits, dim=-1)
-            soft_probs = F.softmax(steered_logits / TEMP_BACKWARD, dim=-1)
-            
-            # Forward pass is sharp_probs, backward pass flows through soft_probs
-            simulated_routing_probs = sharp_probs.detach() - soft_probs.detach() + soft_probs
-
-            # 3. Predict & Calculate Loss
-            lstm_preds = lstm_model(simulated_routing_probs, batch_lengths)
+            # Predict & Calculate Loss
+            lstm_preds = lstm_model(steered_logits, batch_lengths)
 
             bce_loss = criterion(lstm_preds, target_tensor)
             l1_loss = l1_lambda * torch.norm(S, p=1)
@@ -138,14 +107,25 @@ class ModelAwareSteeringHook:
     def __call__(self, module, inputs, output):
         if self.model_name == "deepseek-moe-16b-chat":
             logits = output[0]
-            steered = logits + (self.alpha * self.steering_vector.to(logits.device))
+        else:
+            logits = output
+
+        # Calculate dynamic logit standard deviation for this layer's current forward pass
+        # This keeps inference steering perfectly scaled to the discovery phase
+        sigma_l = logits.std() + 1e-5
+
+        # Apply adaptive scaled intervention
+        steered = logits + (self.alpha * sigma_l * self.steering_vector.to(logits.device))
+
+        # Re-pack output based on model architecture
+        if self.model_name == "deepseek-moe-16b-chat":
             if isinstance(output, tuple):
                 return (steered,) + output[1:]
             elif isinstance(output, list):
                 return [steered] + output[1:]
             return steered
         else:
-            return output + (self.alpha * self.steering_vector.to(output.device))
+            return steered
 
 
 def apply_steering_hooks(model_name, model, gate_name, sparse_S, alpha):
@@ -199,29 +179,51 @@ if __name__ == "__main__":
     device = next(model.parameters()).device
 
     print("\nLoading trained LSTM model...")
-    checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl", map_location=device)
+    lstm_model_dir = os.path.join(root_folder, "results", "trained_lstm_models", model_config.model_name, f"{model_config.model_name}_jailbreak_lstm.pkl")
+    checkpoint = torch.load(lstm_model_dir, map_location=device)
     NUM_TOTAL_EXPERTS, NUM_LAYERS = checkpoint["num_total_experts"], checkpoint["num_layers"]
 
-    lstm = MoETraceClassifierLinear(NUM_TOTAL_EXPERTS, NUM_LAYERS)
+    lstm = lstm_model.MoETraceClassifierLinear(NUM_TOTAL_EXPERTS, NUM_LAYERS)
     lstm.load_state_dict(checkpoint["model_state_dict"])
     lstm = lstm.to(device)
 
-    questions, labels = data_utils.load_adult_set(root_folder, model_config.model_name, malicious_only=True)
-    questions = questions[:1028]  # Sample for discovery
+    conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=True)
 
-    # Pre-tokenize questions for alignment
-    tokenized_qs = []
-    for q_text in questions:
+    prompts = []
+    final_user_questions = []
+
+    print("Formatting prompts with chat templates...")
+    for history in conversation_histories:
+        # The target for our token range is the last message in the history
+        final_user_questions.append(history[-1]["content"])
+
+        # Format full context appropriately for the model
+        chat = [m for m in history if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else history
+
+        if model_config.model_name == "Hunyuan-A13B-Instruct":
+            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        else:
+            prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+
+        prompts.append(prompt)
+
+    # Pre-tokenize the final user turn for matching
+    print("Pre-tokenizing target prompts for alignment...")
+
+    tokenized_questions = []
+    for q_text in tqdm(final_user_questions, desc="Tokenizing Final User Questions"):
         if model_config.model_name == "deepseek-moe-16b-chat":
             q_text = " " + q_text
         elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_text = "\n" + q_text
+
         q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
+
         if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_ids = q_ids[2:]
-        tokenized_qs.append(q_ids)
 
-    prompts = data_utils.construct_prompt(tokenizer, questions, model_config.model_name)
+        tokenized_questions.append(q_ids)
+
     all_logits, all_lengths = [], []
     current_batch_activations = {}
 
@@ -237,7 +239,7 @@ if __name__ == "__main__":
         module = dict(model.named_modules())[name]
         collection_handles.append(module.register_forward_hook(get_collection_hook(i)))
 
-    print(f"Collecting baseline routing logits for {len(questions)} prompts...")
+    print(f"Collecting baseline routing logits for {len(prompts)} prompts...")
 
     BATCH_SIZE = 16
 
@@ -257,10 +259,10 @@ if __name__ == "__main__":
 
         for p_idx in range(b_size):
             global_idx = (b_idx * BATCH_SIZE) + p_idx
-            if global_idx >= len(questions):
+            if global_idx >= len(prompts):
                 break
 
-            start, end = find_token_range(tokenized_qs[global_idx], input_ids_np[p_idx])
+            start, end = find_token_range(tokenized_questions[global_idx], input_ids_np[p_idx])
             if start is None:
                 continue
 
@@ -285,7 +287,7 @@ if __name__ == "__main__":
     trace_dataloader = DataLoader(trace_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     threshold = 0.1
-    lambdas = [0,1e-6,1e-5,1e-4,1e-3]
+    lambdas = [0, 1e-6, 1e-5, 1e-4, 1e-3]
 
     for _lambda in lambdas:
         S_optimized = discover_universal_steering_circuit(
@@ -296,7 +298,7 @@ if __name__ == "__main__":
             target_class=0.0,
             l1_lambda=_lambda,
             lr=0.05,
-            epochs=80,
+            epochs=50,
             threshold=threshold,
         )
 
@@ -322,7 +324,7 @@ if __name__ == "__main__":
 
         S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
-        steering_alphas = [0.6, 0.5, 0.4, 0.3, 0.2]
+        steering_alphas = [2.0, 1.0, 0.5, 0.4, 0.3, 0.2]
 
         for steering_alpha in steering_alphas:
             # Apply Inference Steering
@@ -330,15 +332,16 @@ if __name__ == "__main__":
             active_steering_hooks = apply_steering_hooks(model_config.model_name, model, model_config.gate_name, S_sparse, steering_alpha)
 
             print("\nGenerating Responses with Steering Active...")
-            eval_prompts = data_utils.construct_prompt(tokenizer, questions[:10], model_config.model_name)
-            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=5)
+            eval_prompts = data_utils.construct_prompt(tokenizer, final_user_questions[:10], model_config.model_name)
+            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=10)
 
             for hook in active_steering_hooks:
                 hook.remove()
 
             print(f"\n--- Model Responses for l1_lambda={_lambda}, threshold={threshold}, and alpha={steering_alpha}---")
-            for q, r in zip(questions[:10], eval_responses):
+            for q, r in zip(final_user_questions[:10], eval_responses):
                 print(f"\nPrompt: {[q]}")
-                print(f"Response: {[r.strip()]}")
+                print(f"Response before: {[r.strip()]}")
+                print(f"Response after: {[r.strip()]}")
 
     print("\n------------------ Job Finished ------------------")
