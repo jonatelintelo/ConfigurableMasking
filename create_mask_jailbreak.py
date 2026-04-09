@@ -6,7 +6,9 @@ import sys
 import numpy as np
 from tqdm import tqdm
 import os
+import inspect
 from datasets import load_dataset
+from collections import defaultdict
 
 # Modules defined in your project
 import argument_parser as argument_parser
@@ -22,27 +24,22 @@ class SafetyEvaluator:
         self.tokenizer = j_tokenizer
 
     def evaluate(self, user_questions, generated_text):
-        # Wrap the strings in lists so `zip()` processes them as single items
         judge_prompts = data_utils.construct_judge_prompt(questions=user_questions, responses=generated_text)
-
         safety_flags = []
-
-        # Extract the single formatted chat from the returned list
-        for judge_prompt in tqdm(judge_prompts):
-
-            # Call the moderate function with the single chat prompt
+        for judge_prompt in tqdm(judge_prompts, desc="Running Llama-Guard"):
             judge_output = model_utils.moderate(self.model, self.tokenizer, judge_prompt)
             safety_flags.append("unsafe" in judge_output.lower())
-
         return safety_flags
 
 
-def find_token_range(question_ids, prompt_ids):
+def find_token_range(question_ids, prompt_ids, print_logging=False):
     """Finds the start and end indices of the question within the full prompt."""
     len_q = len(question_ids)
     len_p = len(prompt_ids)
     for i in range(len_p - len_q + 1):
         if np.array_equal(prompt_ids[i : i + len_q], question_ids):
+            if print_logging:
+                print(f"Start: {i}, End: {i + len_q - 1}")
             return i, i + len_q - 1
     return None, None
 
@@ -50,19 +47,8 @@ def find_token_range(question_ids, prompt_ids):
 # ==========================================
 # 2. Phase 1: Universal Circuit Discovery
 # ==========================================
-def discover_universal_steering_circuit(
-    lstm_model,
-    dataloader,
-    num_layers,
-    num_total_experts,
-    target_class,
-    l1_lambda,
-    lr,
-    epochs,
-    threshold,
-):
+def discover_universal_steering_circuit(lstm_model, dataloader, num_layers, num_total_experts, target_class, l1_lambda, lr, epochs, threshold):
     device = next(lstm_model.parameters()).device
-
     S = nn.Parameter(torch.zeros(num_layers, num_total_experts, device=device))
     nn.init.kaiming_uniform_(S)
     optimizer = torch.optim.Adam([S], lr=lr)
@@ -72,28 +58,20 @@ def discover_universal_steering_circuit(
     for param in lstm_model.parameters():
         param.requires_grad = False
 
-    print("\nStarting Universal Circuit Discovery...", flush=True)
+    print(f"\nStarting Circuit Discovery (Lambda: {l1_lambda})...", flush=True)
 
     for epoch in tqdm(range(epochs), desc="Optimizing Circuit", unit="epoch"):
         total_loss, bce_loss_sum = 0, 0
-
         for batch_logits, batch_lengths in dataloader:
             batch_logits = batch_logits.to(device)
             batch_lengths = batch_lengths.cpu()
             target_tensor = torch.full((batch_logits.size(0), 1), target_class, dtype=torch.float32, device=device)
 
             optimizer.zero_grad()
-
-            # --- ADAPTIVE LOGIT SCALING ---
             with torch.no_grad():
-                # Calculate standard deviation per layer (across Batch, Tokens, and Experts)
-                # Adding 1e-5 to prevent division by zero in the backward pass
                 sigma_l = batch_logits.std(dim=(0, 1, 3), keepdim=True) + 1e-5
 
-            # Adaptive Logit Scaling: Scale S by layer variance
             steered_logits = batch_logits + (S.unsqueeze(0).unsqueeze(0) * sigma_l)
-
-            # Predict & Calculate Loss
             lstm_preds = lstm_model(steered_logits, batch_lengths)
 
             bce_loss = criterion(lstm_preds, target_tensor)
@@ -127,41 +105,27 @@ class ModelAwareSteeringHook:
         self.alpha = alpha
 
     def __call__(self, module, inputs, output):
-        if self.model_name == "deepseek-moe-16b-chat":
-            logits = output[0]
-        else:
-            logits = output
-
-        # Calculate dynamic logit standard deviation for this layer's current forward pass
-        # This keeps inference steering perfectly scaled to the discovery phase
+        logits = output[0] if isinstance(output, (tuple, list)) else output
         sigma_l = logits.std() + 1e-5
-
-        # Apply adaptive scaled intervention
         steered = logits + (self.alpha * sigma_l * self.steering_vector.to(logits.device))
 
-        # Re-pack output based on model architecture
-        if self.model_name == "deepseek-moe-16b-chat":
-            if isinstance(output, tuple):
-                return (steered,) + output[1:]
-            elif isinstance(output, list):
-                return [steered] + output[1:]
-            return steered
-        else:
-            return steered
+        if isinstance(output, tuple):
+            return (steered,) + output[1:]
+        elif isinstance(output, list):
+            return [steered] + output[1:]
+        return steered
 
 
 def apply_steering_hooks(model_name, model, gate_name, sparse_S, alpha):
     hook_handles = []
     layer_idx = 0
-
     for layer_name, module in model.named_modules():
-        if layer_name.lower().endswith(gate_name):
+        if layer_name.lower().endswith(gate_name.lower()):
             layer_steering_vector = sparse_S[layer_idx]
             if torch.any(layer_steering_vector != 0):
                 hook_fn = ModelAwareSteeringHook(model_name, layer_name, layer_steering_vector, alpha)
                 handle = module.register_forward_hook(hook_fn)
                 hook_handles.append(handle)
-                # print(f"Injected hook on: '{layer_name}' (Layer {layer_idx})")
             layer_idx += 1
     return hook_handles
 
@@ -175,16 +139,6 @@ if __name__ == "__main__":
     model_id = arguments.model_id
     print_logging = arguments.print_logging
 
-    if print_logging:
-        print(f"\nPython version: {sys.version}")
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA build version: {torch.version.cuda}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        print(f"Number of GPUs: {torch.cuda.device_count()}")
-        if torch.cuda.is_available():
-            print(f"First GPU Name: {torch.cuda.get_device_name(0)}")
-            print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
-
     models = [
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "microsoft/Phi-3.5-MoE-instruct",
@@ -194,6 +148,7 @@ if __name__ == "__main__":
         "tencent/Hunyuan-A13B-Instruct",
         "deepseek-ai/deepseek-moe-16b-chat",
     ]
+
     model_config = model_configurations.models[models[model_id]]
     print(f"\nInitializing: {model_config.model_name}")
 
@@ -209,6 +164,7 @@ if __name__ == "__main__":
     lstm.load_state_dict(checkpoint["model_state_dict"])
     lstm = lstm.to(device)
 
+    # --- Load Data ---
     conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=True)
 
     prompts = []
@@ -216,56 +172,55 @@ if __name__ == "__main__":
 
     print("Formatting prompts with chat templates...")
     for history in conversation_histories:
-        # The target for our token range is the last message in the history
         final_user_questions.append(history[-1]["content"])
-
-        # Format full context appropriately for the model
         chat = [m for m in history if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else history
 
         if model_config.model_name == "Hunyuan-A13B-Instruct":
             prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         else:
             prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-
         prompts.append(prompt)
 
-    # Pre-tokenize the final user turn for matching
     print("Pre-tokenizing target prompts for alignment...")
-
     tokenized_questions = []
-    for q_text in tqdm(final_user_questions, desc="Tokenizing Final User Questions"):
+    for q_text in tqdm(final_user_questions, desc="Tokenizing"):
         if model_config.model_name == "deepseek-moe-16b-chat":
             q_text = " " + q_text
         elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_text = "\n" + q_text
-
         q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
-
         if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
             q_ids = q_ids[2:]
-
         tokenized_questions.append(q_ids)
 
+    EVAL_SIZE = len(prompts)
+    print(f"\nScaling evaluation dataset to {EVAL_SIZE} prompts...")
+
+    eval_prompts = prompts[:EVAL_SIZE]
+    eval_user_questions = final_user_questions[:EVAL_SIZE]
+    eval_tokenized_questions = tokenized_questions[:EVAL_SIZE]
+
+    # --- Collect Baseline Logits (for the Universal Circuit Discovery) ---
     all_logits, all_lengths = [], []
     current_batch_activations = {}
 
     def get_collection_hook(layer_index):
         def hook(module, inp, out):
             logits = out[0] if isinstance(out, (tuple, list)) else out
-            current_batch_activations[layer_index] = logits.detach()  # Keep raw logits
+            current_batch_activations[layer_index] = logits.detach()
 
         return hook
 
     collection_handles = []
-    for i, name in enumerate([n for n, m in model.named_modules() if n.lower().endswith(model_config.gate_name.lower())]):
+    layer_names = [n for n, m in model.named_modules() if n.lower().endswith(model_config.gate_name.lower())]
+    for i, name in enumerate(layer_names):
         module = dict(model.named_modules())[name]
         collection_handles.append(module.register_forward_hook(get_collection_hook(i)))
 
-    print(f"Collecting baseline routing logits for {len(prompts)} prompts...")
-
+    print(f"Collecting baseline routing logits for {EVAL_SIZE} prompts...")
     BATCH_SIZE = 16
 
-    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE)):
+    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(eval_prompts, BATCH_SIZE), total=(len(eval_prompts) + BATCH_SIZE - 1) // BATCH_SIZE)):
         current_batch_activations.clear()
         inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
         b_size, s_len = inputs.input_ids.shape
@@ -281,19 +236,17 @@ if __name__ == "__main__":
 
         for p_idx in range(b_size):
             global_idx = (b_idx * BATCH_SIZE) + p_idx
-            if global_idx >= len(prompts):
+            if global_idx >= len(eval_prompts):
                 break
 
-            start, end = find_token_range(tokenized_questions[global_idx], input_ids_np[p_idx])
+            start, end = find_token_range(eval_tokenized_questions[global_idx], input_ids_np[p_idx])
             if start is None:
                 continue
 
             prompt_trace = []
             for l_idx in range(NUM_LAYERS):
-                # We collect RAW logits, slice them out, and save
                 prompt_trace.append(current_batch_activations[l_idx][p_idx, start : end + 1, :])
 
-            # Stack to [Tokens, Layers, Experts]
             stacked_trace = torch.stack(prompt_trace, dim=1)
             all_logits.append(stacked_trace.cpu())
             all_lengths.append(torch.tensor(stacked_trace.shape[0], dtype=torch.int64))
@@ -301,41 +254,44 @@ if __name__ == "__main__":
     for h in collection_handles:
         h.remove()
 
-    # Create padded dataset using PyTorch's pad_sequence
     padded_logits = torch.nn.utils.rnn.pad_sequence(all_logits, batch_first=True, padding_value=0.0)
     dataset_lengths = torch.stack(all_lengths)
-
     trace_dataset = TensorDataset(padded_logits, dataset_lengths)
     trace_dataloader = DataLoader(trace_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    threshold = 0.1
-    # lambdas = [0, 1e-5, 1e-4, 1e-3]
-    # steering_alphas = [2.0, 1.5, 1.0, 0.6, 0.5, 0.4, 0.2]
-    lambdas = [1e-5]
-    steering_alphas = [1.5,1.2]
-
-
-    print("\n--- Loading Baseline (Unsteered) Responses from File ---", flush=True)
+    print("\n--- Loading Baseline Responses from File ---")
     jailbreak_data_path = f"{root_folder}/data/jailbreak/jailbreak_contexts_{model_config.model_name}.jsonl"
-
-    # Load the full list of original responses
     jailbreak_responses = list(load_dataset("json", data_files=jailbreak_data_path, split="train")["jailbreak_response"])
-
-    # Slice the first 10 to match your final_user_questions[:10] loop later
-    baseline_responses = jailbreak_responses[:BATCH_SIZE]
-
-    eval_prompts = prompts[:BATCH_SIZE]
+    baseline_responses = jailbreak_responses[:EVAL_SIZE]
 
     print("\nLoading Judge Model (Safety Evaluator)...")
     judge_model_name = "meta-llama/Llama-Guard-3-8B"
     judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
     judge_model.eval()
-
     safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
 
-    hook_handles, top_k_expert_indices = model_utils.register_activation_hooks(model_config.model_name, model, model_config.top_k, model_config.gate_name)
+    configs_to_test = [
+        {"lambda": 1e-05, "alphas": [1.2, 1.5]},  # Track 1: Strict Refusal
+        {"lambda": 0.001, "alphas": [0.6, 0.8]},  # Track 2: Nuanced Reframing
+        {"lambda": 0.0001, "alphas": [0.8, 1.0]},  # Track 3: The Goldilocks Zone
+    ]
 
-    for _lambda in lambdas:
+    threshold = 0.1
+    TOP_K_EXPERTS_TO_COLLECT = model_config.top_k
+
+    # Hook definition specifically for Top-K extraction
+    current_batch_topk = {}
+
+    def get_topk_hook(layer_idx, k):
+        def hook(module, input, output):
+            logits = output[0] if isinstance(output, (tuple, list)) else output
+            current_batch_topk[layer_idx] = torch.topk(logits, k=k, dim=-1, sorted=False).indices.detach().cpu().to(torch.int16)
+
+        return hook
+
+    for config in configs_to_test:
+        _lambda = config["lambda"]
+
         S_optimized = discover_universal_steering_circuit(
             lstm_model=lstm,
             dataloader=trace_dataloader,
@@ -348,50 +304,92 @@ if __name__ == "__main__":
             threshold=threshold,
         )
 
-        S_abs = torch.abs(S_optimized).detach().cpu().numpy().flatten()
-
-        print("\n" + "=" * 40)
-        print("S TENSOR DISTRIBUTION ANALYSIS")
-        print("=" * 40)
-        print(f"Total Experts: {len(S_abs)}")
-        print(f"Max absolute value: {S_abs.max():.4f}")
-        print(f"Mean absolute value: {S_abs.mean():.6f}")
-
-        print("\nPercentiles:")
-        for p in [50, 75, 90, 95, 99, 99.9]:
-            print(f"  {p}th percentile: {np.percentile(S_abs, p):.6f}")
-
-        print("\nValue Bins (Absolute Magnitude):")
-        bins = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 10.0]
-        hist, bin_edges = np.histogram(S_abs, bins=bins)
-        for i in range(len(hist)):
-            print(f"  [{bin_edges[i]:.2f} to {bin_edges[i+1]:.2f}): {hist[i]:>5} experts")
-        print("=" * 40 + "\n")
-
         S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
-        for steering_alpha in steering_alphas:
+        for steering_alpha in config["alphas"]:
+            experiment_id = f"lambda_{_lambda}_alpha_{steering_alpha}"
+            print(f"\n" + "=" * 60)
+            print(f"RUNNING EXPERIMENT: {experiment_id}")
+            print("=" * 60)
+
             # Apply Inference Steering
-            print("\n--- Applying Steering Hooks to LLM ---", flush=True)
             active_steering_hooks = apply_steering_hooks(model_config.model_name, model, model_config.gate_name, S_sparse, steering_alpha)
 
-            print("\nGenerating Responses with Steering Active...")
+            # Set up Top-K Hooks
+            active_topk_hooks = []
+            for i, name in enumerate(layer_names):
+                module = dict(model.named_modules())[name]
+                active_topk_hooks.append(module.register_forward_hook(get_topk_hook(i, TOP_K_EXPERTS_TO_COLLECT)))
+
+            # Targeted Forward Pass: Extracting Top-K for User Question Tokens ONLY
+            print("Extracting steered Top-K choices for User Question tokens...")
+            final_topk_traces = []
+
+            for b_idx, batch_prompts in enumerate(data_utils.batchify(eval_prompts, BATCH_SIZE)):
+                current_batch_topk.clear()
+                inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+                b_size, s_len = inputs.input_ids.shape
+
+                with torch.no_grad():
+                    model(**inputs)  # Triggers Top-K hooks with steering active
+
+                input_ids_np = inputs.input_ids.cpu().numpy()
+
+                for p_idx in range(b_size):
+                    global_idx = (b_idx * BATCH_SIZE) + p_idx
+                    if global_idx >= len(eval_prompts):
+                        break
+
+                    start, end = find_token_range(eval_tokenized_questions[global_idx], input_ids_np[p_idx])
+                    if start is None:
+                        continue
+
+                    prompt_topk_trace = []
+                    for l_idx in range(NUM_LAYERS):
+                        if current_batch_topk[l_idx].dim() == 2:
+                            current_batch_topk[l_idx] = current_batch_topk[l_idx].view(b_size, s_len, -1)
+
+                        # Slice out ONLY the target tokens
+                        token_choices = current_batch_topk[l_idx][p_idx, start : end + 1, :]
+                        prompt_topk_trace.append(token_choices)
+
+                    # Stack: [Tokens, Layers, K]
+                    stacked_trace = torch.stack(prompt_topk_trace, dim=1).numpy()
+                    final_topk_traces.append(stacked_trace)
+
+            # Remove Top-K Hooks BEFORE generation
+            for hook in active_topk_hooks:
+                hook.remove()
+
+            # Save the cleanly sliced traces
+            save_dir = os.path.join(root_folder, "results", "topk_routings", model_config.model_name)
+            os.makedirs(save_dir, exist_ok=True)
+            file_name = f"topk_routing_{experiment_id}.pt"
+
+            torch.save(
+                {
+                    "traces": final_topk_traces,  # A list of [Tokens, Layers, K] numpy arrays
+                    "hyperparameters": {"lambda": _lambda, "alpha": steering_alpha, "k": TOP_K_EXPERTS_TO_COLLECT},
+                },
+                os.path.join(save_dir, file_name),
+            )
+
+            print(f"Saved exact Top-K traces for {len(final_topk_traces)} prompts to {file_name}")
+
+            # Generate Responses (Steering is still active!)
+            print("Generating Responses with Steering Active...")
             eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=BATCH_SIZE)
 
+            # Remove Steering Hooks
             for hook in active_steering_hooks:
                 hook.remove()
 
+            # Evaluate Safety
             print("Evaluating Safety in batch...")
             clean_steered_responses = [r.strip() for r in eval_responses]
-            safety_flags = safety_evaluator.evaluate(final_user_questions[BATCH_SIZE], clean_steered_responses)
+            safety_flags = safety_evaluator.evaluate(eval_user_questions, clean_steered_responses)
 
-            print(f"\n--- Model Responses for l1_lambda={_lambda}, threshold={threshold}, and alpha={steering_alpha}---")
+            safe_count = safety_flags.count(False)
+            print(f"\n---> Metric for {experiment_id}: {safe_count}/{EVAL_SIZE} evaluated as SAFE.")
 
-            # Zip the safety flags into the loop alongside the other data
-            for q, base_r, steered_r, is_unsafe in zip(final_user_questions[:BATCH_SIZE], baseline_responses, eval_responses, safety_flags):
-                print(f"\nPrompt: {[q]}")
-                print(f"Baseline (Before Masking): {[base_r.strip()]}")
-                print(f"Steered  (After Masking) : {[steered_r.strip()]}")
-                print(f"Safety Evaluation: {'Unsafe' if is_unsafe else 'Safe'}")
-
-    print("\n------------------ Job Finished ------------------")
+    print("\n------------------ All Experiments Finished ------------------")

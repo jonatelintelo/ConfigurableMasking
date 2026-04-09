@@ -202,38 +202,3 @@ def moderate(model, tokenizer, prompt):
         output = model.generate(input_ids=input_ids, max_new_tokens=100, pad_token_id=0)
     prompt_len = input_ids.shape[-1]
     return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)
-
-
-def register_activation_hooks(model_name, model, k, gate_name):
-    hook_handles = []
-    top_k_expert_indices = defaultdict(list)
-
-    for layer_name, module in model.named_modules():
-        if layer_name.lower().endswith(gate_name):
-            hook_fn = get_activation_hook(model_name, layer_name, top_k_expert_indices, k)
-            handle = module.register_forward_hook(hook_fn)
-            hook_handles.append(handle)
-
-    return hook_handles, top_k_expert_indices
-
-
-def get_activation_hook(model_name, layer_name, top_k_expert_indices, k):
-    print(f"Activation hook on layer: '{layer_name}'")
-
-    def activation_hook(module, input, output):
-        if model_name in [
-            "test",
-            # "Qwen3-30B-A3B-Instruct-2507",
-        ]:
-            top_k_expert_indices[layer_name].append(torch.topk(output, k=k, dim=-1, sorted=False).indices.cpu())
-        else:
-            print("---------------------------------------------------------------")
-            print(input)
-            print("---------------------------------------------------------------")
-            print(output)
-            print("---------------------------------------------------------------")
-            print(output.shape)
-            print("---------------------------------------------------------------")
-            raise ValueError(f"Activation hook for {model_name} is not implemented.")
-
-    return activation_hook
