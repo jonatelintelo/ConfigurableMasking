@@ -6,6 +6,7 @@ import sys
 import numpy as np
 from tqdm import tqdm
 import os
+from datasets import load_dataset
 
 # Modules defined in your project
 import argument_parser as argument_parser
@@ -13,6 +14,27 @@ import moe_model_files.model_utils as model_utils
 import moe_model_files.model_configurations as model_configurations
 import data.data_utils as data_utils
 import lstm.lstm_model as lstm_model
+
+
+class SafetyEvaluator:
+    def __init__(self, j_model, j_tokenizer):
+        self.model = j_model
+        self.tokenizer = j_tokenizer
+
+    def evaluate(self, user_questions, generated_text):
+        # Wrap the strings in lists so `zip()` processes them as single items
+        judge_prompts = data_utils.construct_judge_prompt(questions=user_questions, responses=generated_text)
+
+        safety_flags = []
+
+        # Extract the single formatted chat from the returned list
+        for judge_prompt in tqdm(judge_prompts):
+
+            # Call the moderate function with the single chat prompt
+            judge_output = model_utils.moderate(self.model, self.tokenizer, judge_prompt)
+            safety_flags.append("unsafe" in judge_output.lower())
+
+        return safety_flags
 
 
 def find_token_range(question_ids, prompt_ids):
@@ -287,7 +309,31 @@ if __name__ == "__main__":
     trace_dataloader = DataLoader(trace_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     threshold = 0.1
-    lambdas = [0, 1e-6, 1e-5, 1e-4, 1e-3]
+    # lambdas = [0, 1e-5, 1e-4, 1e-3]
+    # steering_alphas = [2.0, 1.5, 1.0, 0.6, 0.5, 0.4, 0.2]
+    lambdas = [1e-5]
+    steering_alphas = [1.5,1.2]
+
+
+    print("\n--- Loading Baseline (Unsteered) Responses from File ---", flush=True)
+    jailbreak_data_path = f"{root_folder}/data/jailbreak/jailbreak_contexts_{model_config.model_name}.jsonl"
+
+    # Load the full list of original responses
+    jailbreak_responses = list(load_dataset("json", data_files=jailbreak_data_path, split="train")["jailbreak_response"])
+
+    # Slice the first 10 to match your final_user_questions[:10] loop later
+    baseline_responses = jailbreak_responses[:BATCH_SIZE]
+
+    eval_prompts = prompts[:BATCH_SIZE]
+
+    print("\nLoading Judge Model (Safety Evaluator)...")
+    judge_model_name = "meta-llama/Llama-Guard-3-8B"
+    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
+    judge_model.eval()
+
+    safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
+
+    hook_handles, top_k_expert_indices = model_utils.register_activation_hooks(model_config.model_name, model, model_config.top_k, model_config.gate_name)
 
     for _lambda in lambdas:
         S_optimized = discover_universal_steering_circuit(
@@ -298,7 +344,7 @@ if __name__ == "__main__":
             target_class=0.0,
             l1_lambda=_lambda,
             lr=0.05,
-            epochs=50,
+            epochs=100,
             threshold=threshold,
         )
 
@@ -324,24 +370,28 @@ if __name__ == "__main__":
 
         S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
-        steering_alphas = [2.0, 1.0, 0.5, 0.4, 0.3, 0.2]
-
         for steering_alpha in steering_alphas:
             # Apply Inference Steering
             print("\n--- Applying Steering Hooks to LLM ---", flush=True)
             active_steering_hooks = apply_steering_hooks(model_config.model_name, model, model_config.gate_name, S_sparse, steering_alpha)
 
             print("\nGenerating Responses with Steering Active...")
-            eval_prompts = data_utils.construct_prompt(tokenizer, final_user_questions[:10], model_config.model_name)
-            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=10)
+            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=BATCH_SIZE)
 
             for hook in active_steering_hooks:
                 hook.remove()
 
+            print("Evaluating Safety in batch...")
+            clean_steered_responses = [r.strip() for r in eval_responses]
+            safety_flags = safety_evaluator.evaluate(final_user_questions[BATCH_SIZE], clean_steered_responses)
+
             print(f"\n--- Model Responses for l1_lambda={_lambda}, threshold={threshold}, and alpha={steering_alpha}---")
-            for q, r in zip(final_user_questions[:10], eval_responses):
+
+            # Zip the safety flags into the loop alongside the other data
+            for q, base_r, steered_r, is_unsafe in zip(final_user_questions[:BATCH_SIZE], baseline_responses, eval_responses, safety_flags):
                 print(f"\nPrompt: {[q]}")
-                print(f"Response before: {[r.strip()]}")
-                print(f"Response after: {[r.strip()]}")
+                print(f"Baseline (Before Masking): {[base_r.strip()]}")
+                print(f"Steered  (After Masking) : {[steered_r.strip()]}")
+                print(f"Safety Evaluation: {'Unsafe' if is_unsafe else 'Safe'}")
 
     print("\n------------------ Job Finished ------------------")
