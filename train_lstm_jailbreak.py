@@ -168,7 +168,7 @@ if __name__ == "__main__":
     print(f"\nSelected model: {model_config.model_name}")
 
     print("\nLoading precomputed traces...")
-    lstm_input_dir = os.path.join(root_folder, "results", "lstm_input", model_config.model_name)
+    lstm_input_dir = os.path.join(root_folder, "data", "lstm_input", model_config.model_name)
     traces = data_utils.load_data(os.path.join(lstm_input_dir, f"{model_config.model_name}_jailbreak_traces.pkl"))
     labels = data_utils.load_data(os.path.join(lstm_input_dir, f"{model_config.model_name}_jailbreak_labels.pkl"))
 
@@ -186,7 +186,7 @@ if __name__ == "__main__":
 
     checkpoint = {"num_total_experts": model_config.num_router_expert, "num_layers": DETECTED_LAYERS, "model_state_dict": trained_lstm_model.state_dict()}
 
-    lstm_model_dir = os.path.join(root_folder, "results", "trained_lstm_models", model_config.model_name)
+    lstm_model_dir = os.path.join(root_folder, "lstm", "trained_lstm_models", model_config.model_name)
     os.makedirs(lstm_model_dir, exist_ok=True)
 
     lstm_model_path = os.path.join(lstm_model_dir, f"{model_config.model_name}_jailbreak_lstm.pkl")

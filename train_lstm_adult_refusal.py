@@ -167,8 +167,8 @@ if __name__ == "__main__":
     print(f"\nSelected model: {model_config.model_name}")
 
     print("\nLoading precomputed traces...")
-    traces = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_traces.pkl")
-    labels = data_utils.load_data(f"{root_folder}/results/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_labels.pkl")
+    traces = data_utils.load_data(f"{root_folder}/data/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_traces.pkl")
+    labels = data_utils.load_data(f"{root_folder}/data/lstm_input/{model_config.model_name}/{model_config.model_name}_adult_refusal_labels.pkl")
 
     if print_logging:
         print(f"traces length: {len(traces)}")
@@ -184,14 +184,14 @@ if __name__ == "__main__":
 
     checkpoint = {"num_total_experts": model_config.num_router_expert, "num_layers": DETECTED_LAYERS, "model_state_dict": trained_lstm_model.state_dict()}
 
-    data_utils.create_directory(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}")
+    data_utils.create_directory(f"{root_folder}/lstm/trained_lstm_models/{model_config.model_name}")
 
-    torch.save(checkpoint, f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl")
+    torch.save(checkpoint, f"{root_folder}/lstm/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_lstm.pkl")
 
     print("\n🔍 Testing loaded model on validation set...")
 
     # Initialize and load the model
-    checkpoint = torch.load(f"{root_folder}/results/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_adult_refusal_lstm.pkl")
+    checkpoint = torch.load(f"{root_folder}/lstm/trained_lstm_models/{model_config.model_name}/{model_config.model_name}_adult_refusal_lstm.pkl")
 
     loaded_model = lstm_model.MoETraceClassifierLinear(num_total_experts=checkpoint["num_total_experts"], num_layers=checkpoint["num_layers"])
 

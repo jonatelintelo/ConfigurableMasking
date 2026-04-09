@@ -175,7 +175,7 @@ if __name__ == "__main__":
         print(f"\nWarning: Could not find exact token match for {failed_matches} prompts. Check tokenizer spacing logic.")
 
     # Save Results
-    save_path = os.path.join(root_folder, "results", "lstm_input", model_config.model_name)
+    save_path = os.path.join(root_folder, "data", "lstm_input", model_config.model_name)
     os.makedirs(save_path, exist_ok=True)
 
     print("\nSaving traces to disk...")

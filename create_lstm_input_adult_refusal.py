@@ -157,7 +157,7 @@ if __name__ == "__main__":
         h.remove()
 
     # Save Results
-    save_path = os.path.join(root_folder, "results", "lstm_input")
+    save_path = os.path.join(root_folder, "data", "lstm_input", model_config.model_name)
     os.makedirs(save_path, exist_ok=True)
 
     print("\nSaving traces to disk...")
