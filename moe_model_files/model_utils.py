@@ -128,8 +128,9 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
     all_outputs = []
     total_batches = (len(prompts) + batch_size - 1) // batch_size
     model.eval()
+
     with torch.no_grad():
-        for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches):
+        for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches, desc="Generating Responses"):
             input_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
 
             if "token_type_ids" in input_tokens:
@@ -139,16 +140,19 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
 
             input_ids = input_tokens["input_ids"]
 
+            # Generate with explicit pad_token_id
             output_ids = model.generate(
                 **input_tokens,
                 max_new_tokens=max_new_tokens,
                 return_dict_in_generate=True,
+                pad_token_id=tokenizer.pad_token_id,  # Required for clean batched generation
             )
 
+            # Slice out the prompt to isolate generated tokens
             generated_tokens = [output[ids.shape[-1] :] for ids, output in zip(input_ids, output_ids["sequences"])]
 
+            # Decode
             responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
-
             all_outputs.extend(responses)
 
     return all_outputs
@@ -201,4 +205,30 @@ def moderate(model, tokenizer, prompt):
     with torch.no_grad():
         output = model.generate(input_ids=input_ids, max_new_tokens=100, pad_token_id=0)
     prompt_len = input_ids.shape[-1]
+
     return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)
+
+
+def batched_moderate(model, tokenizer, batch_prompts):
+    # Pass the list of prompt dictionaries directly to apply_chat_template.
+    # Set return_dict=True and return_tensors="pt" to bypass manual tokenization entirely.
+    inputs = tokenizer.apply_chat_template(
+        batch_prompts, 
+        padding=True, 
+        truncation=True,
+        return_tensors="pt", 
+        return_dict=True
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            max_new_tokens=10,
+            pad_token_id=tokenizer.pad_token_id, 
+            do_sample=False 
+        )
+
+    prompt_len = inputs.input_ids.shape[-1]
+
+    # Decode only the generation
+    return tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)

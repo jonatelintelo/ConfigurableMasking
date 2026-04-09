@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,12 +23,28 @@ class SafetyEvaluator:
         self.model = judge_model
         self.tokenizer = judge_tokenizer
 
-    def evaluate(self, user_questions, generated_text):
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def evaluate(self, user_questions, generated_text, batch_size=16):
         judge_prompts = data_utils.construct_judge_prompt(questions=user_questions, responses=generated_text)
         safety_flags = []
-        for judge_prompt in tqdm(judge_prompts, desc="Running Llama-Guard"):
-            judge_output = model_utils.moderate(self.model, self.tokenizer, judge_prompt)
-            safety_flags.append("unsafe" in judge_output.lower())
+
+        # Calculate total batches so tqdm knows where 100% is
+        total_batches = (len(judge_prompts) + batch_size - 1) // batch_size
+
+        print("\nRunning Llama-Guard Evaluation in Batches...")
+
+        # Iterate directly over your batchify generator
+        for batch_prompts in tqdm(data_utils.batchify(judge_prompts, batch_size), total=total_batches, desc="Llama-Guard Batches"):
+
+            # Call your batched moderate function
+            batch_outputs = model_utils.batched_moderate(self.model, self.tokenizer, batch_prompts)
+
+            # Evaluate the results of the entire batch
+            for output in batch_outputs:
+                safety_flags.append("unsafe" in output.lower())
+
         return safety_flags
 
 
@@ -314,6 +331,26 @@ if __name__ == "__main__":
         )
         S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
+        S_abs = torch.abs(S_optimized).detach().cpu().numpy().flatten()
+
+        print("\n" + "=" * 40)
+        print("S TENSOR DISTRIBUTION ANALYSIS")
+        print("=" * 40)
+        print(f"Total Experts: {len(S_abs)}")
+        print(f"Max absolute value: {S_abs.max():.4f}")
+        print(f"Mean absolute value: {S_abs.mean():.6f}")
+
+        print("\nPercentiles:")
+        for p in [50, 75, 90, 95, 99, 99.9]:
+            print(f"  {p}th percentile: {np.percentile(S_abs, p):.6f}")
+
+        print("\nValue Bins (Absolute Magnitude):")
+        bins = [0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 10.0]
+        hist, bin_edges = np.histogram(S_abs, bins=bins)
+        for i in range(len(hist)):
+            print(f"  [{bin_edges[i]:.2f} to {bin_edges[i+1]:.2f}): {hist[i]:>5} experts")
+        print("=" * 40 + "\n")
+
         # Phase 2: Test specific Alphas
         for steering_alpha in config["alphas"]:
             experiment_id = f"lambda_{_lambda}_alpha_{steering_alpha}"
@@ -400,5 +437,20 @@ if __name__ == "__main__":
 
             safe_count = safety_flags.count(False)
             print(f"\n---> Metric for {experiment_id}: {safe_count}/{EVAL_SIZE} evaluated as SAFE.")
+
+            print("Saving generated responses to disk...")
+            responses_to_save = []
+
+            for q, base_r, steered_r, is_unsafe in zip(eval_user_questions, baseline_responses, clean_steered_responses, safety_flags):
+                responses_to_save.append({"prompt": q, "baseline_response": base_r.strip(), "steered_response": steered_r, "is_unsafe": is_unsafe})
+
+            response_save_dir = os.path.join(root_folder, "results", "steered_responses", model_config.model_name)
+            os.makedirs(response_save_dir, exist_ok=True)
+            response_file_name = f"responses_{experiment_id}.json"
+
+            with open(os.path.join(response_save_dir, response_file_name), "w", encoding="utf-8") as f:
+                json.dump(responses_to_save, f, indent=4, ensure_ascii=False)
+
+            print(f"Saved {len(responses_to_save)} response logs to {response_file_name}")
 
     print("\n------------------ All Experiments Finished ------------------")
