@@ -3,24 +3,35 @@ import moe_model_files.compute_graph_patcher as compute_graph_patcher
 
 import torch
 import inspect
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from collections import defaultdict
 from tqdm import tqdm
 import types
 import gc
 
 
-def load_model(full_model_name):
+def load_model(full_model_name, quantize=False):
     model_name = full_model_name.split("/")[1]
 
     if model_name in ["Phi-3.5-MoE-instruct", "Hunyuan-A13B-Instruct"]:
-        model = AutoModelForCausalLM.from_pretrained(
-            full_model_name,
-            torch_dtype="auto",
-            device_map="auto",
-            attn_implementation="flash_attention_2",
-            trust_remote_code=False,
-        ).eval()
+        if quantize:
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                full_model_name,
+                torch_dtype="auto",
+                device_map="auto",
+                quantization_config=quant_config,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=False,
+            ).eval()
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                full_model_name,
+                torch_dtype="auto",
+                device_map="auto",
+                attn_implementation="flash_attention_2",
+                trust_remote_code=False,
+            ).eval()
     elif model_name in ["gpt-oss-20b"]:
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
@@ -121,7 +132,7 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
         "gpt-oss-20b",
         "Hunyuan-A13B-Instruct",
     ]:
-        max_new_tokens = 2048  # We give thinking models more token budget
+        max_new_tokens = 1024  # We give thinking models more token budget
     else:
         max_new_tokens = 128
 
@@ -154,6 +165,10 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
             # Decode
             responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
             all_outputs.extend(responses)
+
+            del input_tokens, input_ids, output_ids, generated_tokens
+            gc.collect()
+            torch.cuda.empty_cache()
 
     return all_outputs
 
@@ -191,13 +206,13 @@ def generate_output_with_yield(model, model_name, tokenizer, prompts, batch_size
 
             responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
 
-            # 1. YIELD instead of extending a list
+            # YIELD instead of extending a list
             yield responses
 
-            # 2. Force memory cleanup before the next batch loads
+            # Force memory cleanup before the next batch loads
             del input_tokens, input_ids, output_ids, generated_tokens
-            torch.cuda.empty_cache()
             gc.collect()
+            torch.cuda.empty_cache()
 
 
 def moderate(model, tokenizer, prompt):

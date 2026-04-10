@@ -103,7 +103,7 @@ if __name__ == "__main__":
 
     def get_activation_hook(layer_idx):
         def hook(module, input, output):
-            logits = output[0] if isinstance(output, (tuple, list)) else output
+            logits = output[2] if isinstance(output, (tuple, list)) else output
             current_batch_activations[layer_idx] = logits.detach().to(torch.float16)
 
         return hook
@@ -186,6 +186,10 @@ if __name__ == "__main__":
         print(f"\nNumber of traces: {len(final_traces)}")
         print(f"Number of labels: {len(final_labels)}")
         print(f"Shape of a trace: {final_traces[0].shape}")
+        print(f"traces[0]: {final_traces[0]}")
+        print(f"labels[0]: {final_labels[0]}")
+        print(f"traces[-1]: {final_traces[len(final_traces)-1]}")
+        print(f"labels[-1]: {final_labels[len(final_labels)-1]}")
 
     print(f"\nSaved {len(final_traces)} traces to {save_path}")
     print("\n------------------ Job Finished ------------------")

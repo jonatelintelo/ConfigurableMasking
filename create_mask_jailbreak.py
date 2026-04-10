@@ -26,27 +26,18 @@ class SafetyEvaluator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def evaluate(self, user_questions, generated_text, batch_size=16):
-        judge_prompts = data_utils.construct_judge_prompt(questions=user_questions, responses=generated_text)
+    def evaluate(self, conversation_histories, generated_text, batch_size=16):
+        judge_prompts = data_utils.construct_judge_prompt_histories(histories=conversation_histories, responses=generated_text)
         safety_flags = []
-
-        # Calculate total batches so tqdm knows where 100% is
         total_batches = (len(judge_prompts) + batch_size - 1) // batch_size
 
-        print("\nRunning Llama-Guard Evaluation in Batches...")
-
-        # Iterate directly over your batchify generator
         for batch_prompts in tqdm(data_utils.batchify(judge_prompts, batch_size), total=total_batches, desc="Llama-Guard Batches"):
-
-            # Call your batched moderate function
             batch_outputs = model_utils.batched_moderate(self.model, self.tokenizer, batch_prompts)
 
-            # Evaluate the results of the entire batch
             for output in batch_outputs:
                 safety_flags.append("unsafe" in output.lower())
 
         return safety_flags
-
 
 def find_token_range(question_ids, prompt_ids):
     """Finds the start and end indices of the target question within the full prompt."""
@@ -192,11 +183,15 @@ if __name__ == "__main__":
 
     prompts = []
     final_user_questions = []
+    eval_histories = [] # NEW: Store histories for the judge
 
     print("Formatting prompts with chat templates...")
     for history in conversation_histories:
         final_user_questions.append(history[-1]["content"])
         chat = [m for m in history if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else history
+
+        clean_history = [m for m in history if m["role"] != "system"]
+        eval_histories.append(clean_history)
 
         if model_config.model_name == "Hunyuan-A13B-Instruct":
             prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, enable_thinking=False)
@@ -218,11 +213,13 @@ if __name__ == "__main__":
         tokenized_questions.append(q_ids)
 
     EVAL_SIZE = len(prompts)
+    EVAL_SIZE = 16
     print(f"\nEvaluating dataset: {EVAL_SIZE} prompts.")
 
     eval_prompts = prompts[:EVAL_SIZE]
     eval_user_questions = final_user_questions[:EVAL_SIZE]
     eval_tokenized_questions = tokenized_questions[:EVAL_SIZE]
+    eval_chat_histories = eval_histories[:EVAL_SIZE]
 
     # --- Collect Baseline Logits (For LSTM Circuit Discovery) ---
     all_logits, all_lengths = [], []
@@ -242,10 +239,10 @@ if __name__ == "__main__":
             collection_handles.append(module.register_forward_hook(get_collection_hook(layer_idx)))
             layer_idx += 1
 
-    print(f"Collecting baseline routing logits for {EVAL_SIZE} prompts...")
+    print(f"Collecting baseline routing logits for {len(prompts)} prompts...")
     BATCH_SIZE = 16
 
-    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(eval_prompts, BATCH_SIZE), total=(len(eval_prompts) + BATCH_SIZE - 1) // BATCH_SIZE)):
+    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE, desc="Collect Baseline Logits")):
         current_batch_activations.clear()
         inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
         b_size, s_len = inputs.input_ids.shape
@@ -262,10 +259,10 @@ if __name__ == "__main__":
 
         for p_idx in range(b_size):
             global_idx = (b_idx * BATCH_SIZE) + p_idx
-            if global_idx >= len(eval_prompts):
+            if global_idx >= len(prompts):
                 break
 
-            start, end = find_token_range(eval_tokenized_questions[global_idx], input_ids_np[p_idx])
+            start, end = find_token_range(tokenized_questions[global_idx], input_ids_np[p_idx])
             if start is None:
                 continue
 
@@ -433,7 +430,8 @@ if __name__ == "__main__":
 
             print("Evaluating Safety...")
             clean_steered_responses = [r.strip() for r in eval_responses]
-            safety_flags = safety_evaluator.evaluate(eval_user_questions, clean_steered_responses)
+            # safety_flags = safety_evaluator.evaluate(eval_user_questions, clean_steered_responses)
+            safety_flags = safety_evaluator.evaluate(eval_chat_histories, clean_steered_responses)
 
             safe_count = safety_flags.count(False)
             print(f"\n---> Metric for {experiment_id}: {safe_count}/{EVAL_SIZE} evaluated as SAFE.")
@@ -441,15 +439,23 @@ if __name__ == "__main__":
             print("Saving generated responses to disk...")
             responses_to_save = []
 
-            for q, base_r, steered_r, is_unsafe in zip(eval_user_questions, baseline_responses, clean_steered_responses, safety_flags):
-                responses_to_save.append({"prompt": q, "baseline_response": base_r.strip(), "steered_response": steered_r, "is_unsafe": is_unsafe})
+            # for q, base_r, steered_r, is_unsafe in zip(eval_user_questions, baseline_responses, clean_steered_responses, safety_flags):
+            #     responses_to_save.append({"prompt": q, "baseline_response": base_r.strip(), "steered_response": steered_r, "is_safe": not is_unsafe})
+
+            for history, base_r, steered_r, is_unsafe in zip(eval_chat_histories, baseline_responses, clean_steered_responses, safety_flags):
+                responses_to_save.append({
+                    "history": history, 
+                    "baseline_response": base_r.strip(), 
+                    "steered_response": steered_r, 
+                    "is_safe": not is_unsafe
+                })
 
             response_save_dir = os.path.join(root_folder, "results", "steered_responses", model_config.model_name)
             os.makedirs(response_save_dir, exist_ok=True)
             response_file_name = f"responses_{experiment_id}.json"
 
-            with open(os.path.join(response_save_dir, response_file_name), "w", encoding="utf-8") as f:
-                json.dump(responses_to_save, f, indent=4, ensure_ascii=False)
+            # with open(os.path.join(response_save_dir, response_file_name), "w", encoding="utf-8") as f:
+            #     json.dump(responses_to_save, f, indent=4, ensure_ascii=False)
 
             print(f"Saved {len(responses_to_save)} response logs to {response_file_name}")
 

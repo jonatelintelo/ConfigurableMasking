@@ -33,6 +33,22 @@ class SafetyEvaluator:
         # Evaluate if the output was flagged as unsafe
         return "unsafe" in judge_output.lower()
 
+    def evaluate_history(self, full_history, generated_text):
+        # We use the 'histories' version because full_history is a list of dicts
+        # Wrap full_history and generated_text in lists to satisfy the zip() in the helper
+        judge_prompts = data_utils.construct_judge_prompt_histories(
+            histories=[full_history], 
+            responses=[generated_text]
+        )
+
+        # Extract the single formatted chat
+        single_judge_prompt = judge_prompts[0]
+
+        # Use the moderate utility to get the Llama-Guard decision
+        judge_output = model_utils.moderate(self.model, self.tokenizer, single_judge_prompt)
+
+        return "unsafe" in judge_output.lower()
+
 
 def process_conversations_batched(conversations, model, tokenizer, safety_evaluator, model_name, batch_size, output_file):
     custom_system_prompt = (
@@ -112,7 +128,10 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
             question = active_conv["context"][-1]["content"]
 
             # Evaluate using Llama-Guard
-            is_harmful = safety_evaluator.evaluate(question, response_text)
+            # is_harmful = safety_evaluator.evaluate(question, response_text)
+            full_history = active_conv["context"] # Pass the whole list of dictionaries
+            clean_history = [m for m in full_history if m["role"] != "system"]
+            is_harmful = safety_evaluator.evaluate_history(clean_history, response_text)
 
             if is_harmful:
                 # Jailbreak successful! Format the data
@@ -128,6 +147,7 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
                 # Instant save and append
                 with open(output_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(jailbreak_data) + "\n")
+                print(f"Wrote jailbreak to file: {jailbreak_data}", flush=True)
 
                 to_remove.append(idx)
                 active_conv["finished"] = True  # Mark to trigger pbar update
@@ -245,7 +265,7 @@ if __name__ == "__main__":
     # Load Models (Target MoE and Judge)
     # ---------------------------------------------------------
     print("\nLoading Target MoE Model and Tokenizer...")
-    model, tokenizer = model_utils.load_model(models[model_id])
+    model, tokenizer = model_utils.load_model(models[model_id], quantize=True)
 
     print("\nLoading Judge Model (Safety Evaluator)...")
     judge_model_name = "meta-llama/Llama-Guard-3-8B"
@@ -267,9 +287,9 @@ if __name__ == "__main__":
     output_jailbreak_path = os.path.join(jailbreak_data_dir, f"jailbreak_contexts_{model_config.model_name}.jsonl")
 
     if not os.path.exists(output_jailbreak_path):
-        BATCH_SIZE = 8
+        BATCH_SIZE = 16
 
-        print(f"\nStarting Batched Free-Generation evaluation with Batch Size {BATCH_SIZE}...")
+        print(f"\nStarting jailbreak evaluation with Batch Size {BATCH_SIZE}...")
 
         successful_jailbreaks = process_conversations_batched(
             conversations=conversations,
@@ -329,6 +349,8 @@ if __name__ == "__main__":
             responses = model_utils.generate_output(
                 model=model, model_name=model_config.model_name, tokenizer=tokenizer, prompts=batch_prompts, batch_size=len(batch_prompts)
             )
+
+            torch.cuda.empty_cache()  # Clear GPU memory after each batch to prevent OOM issues
 
             # Evaluate responses for refusals
             for i, response in enumerate(responses):
