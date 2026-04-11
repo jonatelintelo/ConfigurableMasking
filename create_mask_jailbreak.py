@@ -1,11 +1,11 @@
 import os
-import json
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from datasets import load_dataset
+import gc
 
 # Project Modules
 import argument_parser as argument_parser
@@ -39,14 +39,32 @@ class SafetyEvaluator:
 
         return safety_flags
 
-def find_token_range(question_ids, prompt_ids):
-    """Finds the start and end indices of the target question within the full prompt."""
-    len_q = len(question_ids)
-    len_p = len(prompt_ids)
-    for i in range(len_p - len_q + 1):
-        if np.array_equal(prompt_ids[i : i + len_q], question_ids):
-            return i, i + len_q - 1
-    return None, None
+
+def find_token_range_by_offsets(prompt_text, question_text, offsets):
+    """Finds token start and end using character offset mappings."""
+    char_start = prompt_text.rfind(question_text.strip())
+    if char_start == -1:
+        return None, None
+
+    char_end = char_start + len(question_text.strip())
+
+    start_idx, end_idx = None, None
+
+    for i, (tok_start, tok_end) in enumerate(offsets):
+        if tok_start == tok_end:
+            continue
+        if start_idx is None and tok_end > char_start:
+            start_idx = i
+        if tok_start < char_end:
+            end_idx = i
+
+    return start_idx, end_idx
+
+
+def flush():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
 
 # ==========================================
@@ -114,11 +132,12 @@ class ModelAwareSteeringHook:
         self.alpha = alpha
 
     def __call__(self, module, inputs, output):
-        # Unwrap tuple outputs for architectures like Mixtral/DeepSeek
         logits = output[0] if isinstance(output, (tuple, list)) else output
-        sigma_l = logits.std() + 1e-5
+        if self.steering_vector.device != logits.device:
+            self.steering_vector = self.steering_vector.to(logits.device)
 
-        steered = logits + (self.alpha * sigma_l * self.steering_vector.to(logits.device))
+        sigma_l = logits.std() + 1e-5
+        steered = logits + (self.alpha * sigma_l * self.steering_vector)
 
         # Repack into original output format
         if isinstance(output, tuple):
@@ -183,7 +202,7 @@ if __name__ == "__main__":
 
     prompts = []
     final_user_questions = []
-    eval_histories = [] # NEW: Store histories for the judge
+    eval_histories = []
 
     print("Formatting prompts with chat templates...")
     for history in conversation_histories:
@@ -199,26 +218,12 @@ if __name__ == "__main__":
             prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
         prompts.append(prompt)
 
-    print("Pre-tokenizing target prompts for alignment...")
-    tokenized_questions = []
-    for q_text in tqdm(final_user_questions, desc="Tokenizing"):
-        if model_config.model_name == "deepseek-moe-16b-chat":
-            q_text = " " + q_text
-        elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
-            q_text = "\n" + q_text
-
-        q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
-        if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
-            q_ids = q_ids[2:]
-        tokenized_questions.append(q_ids)
-
     EVAL_SIZE = len(prompts)
     EVAL_SIZE = 16
     print(f"\nEvaluating dataset: {EVAL_SIZE} prompts.")
 
     eval_prompts = prompts[:EVAL_SIZE]
     eval_user_questions = final_user_questions[:EVAL_SIZE]
-    eval_tokenized_questions = tokenized_questions[:EVAL_SIZE]
     eval_chat_histories = eval_histories[:EVAL_SIZE]
 
     # --- Collect Baseline Logits (For LSTM Circuit Discovery) ---
@@ -228,7 +233,7 @@ if __name__ == "__main__":
     def get_collection_hook(layer_index):
         def hook(module, inp, out):
             logits = out[0] if isinstance(out, (tuple, list)) else out
-            current_batch_activations[layer_index] = logits.detach()
+            current_batch_activations[layer_index] = logits.detach().cpu()
 
         return hook
 
@@ -242,9 +247,15 @@ if __name__ == "__main__":
     print(f"Collecting baseline routing logits for {len(prompts)} prompts...")
     BATCH_SIZE = 16
 
-    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE, desc="Collect Baseline Logits")):
+    for b_idx, batch_prompts in enumerate(
+        tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE, desc="Collect Baseline Logits")
+    ):
         current_batch_activations.clear()
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True)
+        offset_mappings = inputs.pop("offset_mapping").cpu().numpy()
+        inputs = inputs.to(device)
+
         b_size, s_len = inputs.input_ids.shape
 
         with torch.no_grad():
@@ -262,7 +273,11 @@ if __name__ == "__main__":
             if global_idx >= len(prompts):
                 break
 
-            start, end = find_token_range(tokenized_questions[global_idx], input_ids_np[p_idx])
+            prompt_text = batch_prompts[p_idx]
+            q_text = final_user_questions[global_idx]
+
+            start, end = find_token_range_by_offsets(prompt_text, q_text, offset_mappings[p_idx])
+
             if start is None:
                 continue
 
@@ -288,16 +303,12 @@ if __name__ == "__main__":
     jailbreak_responses = list(load_dataset("json", data_files=jailbreak_data_path, split="train")["jailbreak_response"])
     baseline_responses = jailbreak_responses[:EVAL_SIZE]
 
-    judge_model_name = "meta-llama/Llama-Guard-3-8B"
-    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
-    judge_model.eval()
-    safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
-
     # --- Experiment Tracks ---
     configs_to_test = [
-        {"lambda": 1e-05, "alphas": [1.2, 1.5]},  # Track 1: Strict Refusal
-        {"lambda": 0.001, "alphas": [0.6, 0.8]},  # Track 2: Nuanced Reframing
-        {"lambda": 0.0001, "alphas": [0.8, 1.0]},  # Track 3: The Goldilocks Zone
+        {"lambda": 0, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8]},
+        {"lambda": 1e-05, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8]},
+        {"lambda": 1e-4, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8]},
+        {"lambda": 1e-3, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8]},
     ]
 
     threshold = 0.1
@@ -310,6 +321,11 @@ if __name__ == "__main__":
             current_batch_topk[layer_idx] = torch.topk(logits, k=k, dim=-1, sorted=False).indices.detach().cpu().to(torch.int16)
 
         return hook
+
+    judge_model_name = "meta-llama/Llama-Guard-3-8B"
+    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
+    judge_model.eval()
+    safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
 
     for config in configs_to_test:
         _lambda = config["lambda"]
@@ -326,6 +342,7 @@ if __name__ == "__main__":
             epochs=100,
             threshold=threshold,
         )
+
         S_sparse = torch.where(torch.abs(S_optimized) > threshold, S_optimized, torch.zeros_like(S_optimized))
 
         S_abs = torch.abs(S_optimized).detach().cpu().numpy().flatten()
@@ -370,24 +387,27 @@ if __name__ == "__main__":
 
             for b_idx, batch_prompts in enumerate(data_utils.batchify(eval_prompts, BATCH_SIZE)):
                 current_batch_topk.clear()
-                inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+
+                inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True)
+                offset_mappings = inputs.pop("offset_mapping").cpu().numpy()
+                inputs = inputs.to(device)
+
                 b_size, s_len = inputs.input_ids.shape
 
-                # Targeted forward pass (triggers Top-K hooks with steering active)
                 with torch.no_grad():
                     model(**inputs)
-
-                input_ids_np = inputs.input_ids.cpu().numpy()
 
                 for p_idx in range(b_size):
                     global_idx = (b_idx * BATCH_SIZE) + p_idx
                     if global_idx >= len(eval_prompts):
                         break
 
-                    start, end = find_token_range(eval_tokenized_questions[global_idx], input_ids_np[p_idx])
+                    prompt_text = batch_prompts[p_idx]
+                    q_text = eval_user_questions[global_idx]
+
+                    start, end = find_token_range_by_offsets(prompt_text, q_text, offset_mappings[p_idx])
 
                     if start is None:
-                        # Prevent desync if token matching fails
                         final_topk_traces.append(np.array([]))
                         continue
 
@@ -443,12 +463,7 @@ if __name__ == "__main__":
             #     responses_to_save.append({"prompt": q, "baseline_response": base_r.strip(), "steered_response": steered_r, "is_safe": not is_unsafe})
 
             for history, base_r, steered_r, is_unsafe in zip(eval_chat_histories, baseline_responses, clean_steered_responses, safety_flags):
-                responses_to_save.append({
-                    "history": history, 
-                    "baseline_response": base_r.strip(), 
-                    "steered_response": steered_r, 
-                    "is_safe": not is_unsafe
-                })
+                responses_to_save.append({"history": history, "baseline_response": base_r.strip(), "steered_response": steered_r, "is_safe": not is_unsafe})
 
             response_save_dir = os.path.join(root_folder, "results", "steered_responses", model_config.model_name)
             os.makedirs(response_save_dir, exist_ok=True)
