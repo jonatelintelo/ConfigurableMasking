@@ -1,15 +1,20 @@
-import moe_model_files.model_configurations as model_configurations
-import moe_model_files.model_utils as model_utils
-import data.data_utils as data_utils
-import argument_parser as argument_parser
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
 import torch
 import sys
-import os
+import gc
 import pandas as pd
 from tqdm import tqdm
 from datasets import load_dataset
+
+# Import modules from our codebase
+import moe_model_files.model_configurations as model_configurations
+import moe_model_files.model_utils as model_utils
+import data.data_utils as data_utils
+import argument_parser as argument_parser
 
 
 # ====================================================================
@@ -36,10 +41,7 @@ class SafetyEvaluator:
     def evaluate_history(self, full_history, generated_text):
         # We use the 'histories' version because full_history is a list of dicts
         # Wrap full_history and generated_text in lists to satisfy the zip() in the helper
-        judge_prompts = data_utils.construct_judge_prompt_histories(
-            histories=[full_history], 
-            responses=[generated_text]
-        )
+        judge_prompts = data_utils.construct_judge_prompt_histories(histories=[full_history], responses=[generated_text])
 
         # Extract the single formatted chat
         single_judge_prompt = judge_prompts[0]
@@ -120,6 +122,9 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
         # Batched Generation
         responses = model_utils.generate_output(model=model, model_name=model_name, tokenizer=tokenizer, prompts=prompts, batch_size=len(prompts))
 
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Evaluate Safety & Update State
         to_remove = []
         for i, response_text in enumerate(responses):
@@ -129,7 +134,7 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
 
             # Evaluate using Llama-Guard
             # is_harmful = safety_evaluator.evaluate(question, response_text)
-            full_history = active_conv["context"] # Pass the whole list of dictionaries
+            full_history = active_conv["context"]  # Pass the whole list of dictionaries
             clean_history = [m for m in full_history if m["role"] != "system"]
             is_harmful = safety_evaluator.evaluate_history(clean_history, response_text)
 
@@ -155,6 +160,11 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
                 # Safe response: append to context and move to the next turn
                 active_conv["context"].append({"role": "assistant", "content": response_text})
                 active_conv["msg_idx"] += 1
+
+        del responses
+        del prompts
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Clean up broken/finished conversations and refill the pool
         for idx in to_remove:
@@ -269,7 +279,7 @@ if __name__ == "__main__":
 
     print("\nLoading Judge Model (Safety Evaluator)...")
     judge_model_name = "meta-llama/Llama-Guard-3-8B"
-    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
+    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name, quantize=True)
     judge_model.eval()
 
     safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
@@ -287,7 +297,7 @@ if __name__ == "__main__":
     output_jailbreak_path = os.path.join(jailbreak_data_dir, f"jailbreak_contexts_{model_config.model_name}.jsonl")
 
     if not os.path.exists(output_jailbreak_path):
-        BATCH_SIZE = 16
+        BATCH_SIZE = 4
 
         print(f"\nStarting jailbreak evaluation with Batch Size {BATCH_SIZE}...")
 
