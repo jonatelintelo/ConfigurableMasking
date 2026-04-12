@@ -1,19 +1,19 @@
-import data.data_utils as data_utils
-import moe_model_files.compute_graph_patcher as compute_graph_patcher
-
 import torch
 import inspect
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from collections import defaultdict
 from tqdm import tqdm
 import types
 import gc
+
+# Import modules from our codebase
+import data.data_utils as data_utils
+import moe_model_files.compute_graph_patcher as compute_graph_patcher
 
 
 def load_model(full_model_name, quantize=False):
     model_name = full_model_name.split("/")[1]
 
-    if model_name in ["Phi-3.5-MoE-instruct", "Hunyuan-A13B-Instruct"]:
+    if model_name == "Phi-3.5-MoE-instruct":
         if quantize:
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
             model = AutoModelForCausalLM.from_pretrained(
@@ -32,7 +32,7 @@ def load_model(full_model_name, quantize=False):
                 attn_implementation="flash_attention_2",
                 trust_remote_code=False,
             ).eval()
-    elif model_name in ["gpt-oss-20b"]:
+    elif model_name == "gpt-oss-20b":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
             torch_dtype="auto",
@@ -48,10 +48,10 @@ def load_model(full_model_name, quantize=False):
             trust_remote_code=True,
         ).eval()
 
-    if model_name in ["deepseek-moe-16b-chat"]:
+    if model_name == "deepseek-moe-16b-chat":
         from transformers.cache_utils import DynamicCache
 
-        # 1. Fix 'seen_tokens' (redirects to get_seq_length)
+        # Fix 'seen_tokens' (redirects to get_seq_length)
         if not hasattr(DynamicCache, "seen_tokens"):
 
             @property
@@ -60,7 +60,7 @@ def load_model(full_model_name, quantize=False):
 
             DynamicCache.seen_tokens = seen_tokens
 
-        # 2. Fix 'get_max_length' (returns None because DynamicCache grows indefinitely)
+        # Fix 'get_max_length' (returns None because DynamicCache grows indefinitely)
         if not hasattr(DynamicCache, "get_max_length"):
 
             def get_max_length(self):
@@ -68,7 +68,7 @@ def load_model(full_model_name, quantize=False):
 
             DynamicCache.get_max_length = get_max_length
 
-        # 3. Fix 'get_usable_length' (handles both single and double argument calls)
+        # Fix 'get_usable_length' (handles both single and double argument calls)
         if not hasattr(DynamicCache, "get_usable_length"):
 
             def get_usable_length(self, input_seq_len, layer_idx=0):
@@ -78,9 +78,7 @@ def load_model(full_model_name, quantize=False):
 
             DynamicCache.get_usable_length = get_usable_length
         print("\nDynamicCache successfully patched for compatibility with deepseek-moe-16b-chat.")
-        # --- END PATCH ---
 
-    if model_name == "deepseek-moe-16b-chat":
         for layer in model.model.layers:
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
                 layer.mlp.gate.forward = types.MethodType(compute_graph_patcher.deepseek_moe_gate_forward, layer.mlp.gate)
@@ -94,6 +92,7 @@ def load_model(full_model_name, quantize=False):
                 layer.mlp.forward = types.MethodType(compute_graph_patcher.GptOssMLP_forward, layer.mlp)
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.forward = types.MethodType(compute_graph_patcher.GptOssTopKRouter_forward, layer.mlp.router)
+                
                 # Replace experts
                 if hasattr(layer.mlp, "experts"):
                     old_experts = layer.mlp.experts
@@ -114,6 +113,7 @@ def load_model(full_model_name, quantize=False):
 
                     # Replace the experts module
                     layer.mlp.experts = new_experts
+
         print("Patching finished")
 
     tokenizer = AutoTokenizer.from_pretrained(full_model_name, trust_remote_code=True)
@@ -227,21 +227,10 @@ def moderate(model, tokenizer, prompt):
 def batched_moderate(model, tokenizer, batch_prompts):
     # Pass the list of prompt dictionaries directly to apply_chat_template.
     # Set return_dict=True and return_tensors="pt" to bypass manual tokenization entirely.
-    inputs = tokenizer.apply_chat_template(
-        batch_prompts, 
-        padding=True, 
-        truncation=True,
-        return_tensors="pt", 
-        return_dict=True
-    ).to(model.device)
+    inputs = tokenizer.apply_chat_template(batch_prompts, padding=True, truncation=True, return_tensors="pt", return_dict=True).to(model.device)
 
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs, 
-            max_new_tokens=10,
-            pad_token_id=tokenizer.pad_token_id, 
-            do_sample=False 
-        )
+        outputs = model.generate(**inputs, max_new_tokens=10, pad_token_id=tokenizer.pad_token_id, do_sample=False)
 
     prompt_len = inputs.input_ids.shape[-1]
 

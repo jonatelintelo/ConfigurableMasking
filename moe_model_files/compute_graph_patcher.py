@@ -82,7 +82,7 @@ def qwen1_5_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
 
     shared_expert_output = self.shared_expert(hidden_states)
-    shared_expert_output = F.sigmoid(shared_expert_logits) * shared_expert_output
+    shared_expert_output = torch.sigmoid(shared_expert_logits) * shared_expert_output
 
     final_hidden_states = final_hidden_states + shared_expert_output
 
