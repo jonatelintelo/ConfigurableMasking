@@ -2,6 +2,5 @@ __pycache__/
 slurm/
 results/
 jailbreak_old/
-adult_refusal/
 lstm/trained_lstm_models/
 data/lstm_input/
