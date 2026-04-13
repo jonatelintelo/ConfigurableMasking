@@ -1,6 +1,5 @@
 __pycache__/
 slurm/
 results/
-jailbreak_old/
-lstm/trained_lstm_models/
+data/old_jailbreak/
 data/lstm_input/
