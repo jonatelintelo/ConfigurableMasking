@@ -1,4 +1,3 @@
-import pathlib
 import pickle
 import numpy as np
 import re
@@ -117,25 +116,28 @@ def construct_judge_prompt(questions, responses):
         prompts.append(chat)
     return prompts
 
+
 def construct_judge_prompt_histories(histories, responses):
     prompts = []
     for history, response in zip(histories, responses):
         if not response.strip():
             response = "Sorry, I cannot assist with that."
-        
+
         # Assuming extract_text_after_think is defined elsewhere in your utils
-        response = extract_text_after_think(response) 
-        
+        response = extract_text_after_think(response)
+
         # Create a copy of the history so we don't mutate the original dataset
         chat = list(history)
-        
+
         # Append the new steered response as the assistant's turn
-        chat.append({
-            "role": "assistant",
-            "content": str(response).replace("[", "").replace("]", ""),
-        })
+        chat.append(
+            {
+                "role": "assistant",
+                "content": str(response).replace("[", "").replace("]", ""),
+            }
+        )
         prompts.append(chat)
-        
+
     return prompts
 
 

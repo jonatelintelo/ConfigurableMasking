@@ -1,9 +1,7 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
 import sys
 import os
-import json
 import inspect
 from tqdm import tqdm
 
@@ -14,19 +12,35 @@ import data.data_utils as data_utils
 import argument_parser as argument_parser
 
 
-def find_token_range(question_ids, prompt_ids, print_logging):
-    """Finds the start and end indices of the question within the full prompt."""
-    len_q = len(question_ids)
-    len_p = len(prompt_ids)
-    for i in range(len_p - len_q + 1):
-        if np.array_equal(prompt_ids[i : i + len_q], question_ids):
-            if print_logging:
-                print(f"prompt_ids: {prompt_ids}")
-                print(f"question_ids: {question_ids}")
-                print(f"start: {i}")
-                print(f"end: {i + len_q - 1}")
-            return i, i + len_q - 1
-    return None, None
+def find_token_range_by_offsets(prompt_text, question_text, offsets, print_logging):
+    """Finds token start and end using character offset mappings."""
+    # Find where the question starts in the raw string
+    char_start = prompt_text.rfind(question_text.strip())
+    if char_start == -1:
+        return None, None
+
+    char_end = char_start + len(question_text.strip())
+
+    start_idx = None
+    end_idx = None
+
+    for i, (tok_start, tok_end) in enumerate(offsets):
+        if tok_start == tok_end:  # Skip (0,0) padding or special tokens
+            continue
+
+        # First token that overlaps with the start of the question text
+        if start_idx is None and tok_end > char_start:
+            start_idx = i
+
+        # Continuously update the end_idx as long as the token starts before the question ends
+        if tok_start < char_end:
+            end_idx = i
+
+    if print_logging and start_idx is not None:
+        print(f"Question char range: {char_start} to {char_end}")
+        print(f"start token idx: {start_idx}, end token idx: {end_idx}")
+
+    return start_idx, end_idx
 
 
 if __name__ == "__main__":
@@ -81,30 +95,12 @@ if __name__ == "__main__":
 
         prompts.append(prompt)
 
-    # Pre-tokenize the final user turn for matching
-    print("Pre-tokenizing target prompts for alignment...")
-
-    tokenized_questions = []
-    for q_text in tqdm(final_user_questions, desc="Tokenizing Final User Questions"):
-        if model_config.model_name == "deepseek-moe-16b-chat":
-            q_text = " " + q_text
-        elif model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
-            q_text = "\n" + q_text
-
-        q_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
-
-        if model_config.model_name == "Mixtral-8x7B-Instruct-v0.1":
-            q_ids = q_ids[2:]
-
-        tokenized_questions.append(q_ids)
-
-    # Setup PyTorch Hooks
     current_batch_activations = {}
 
     def get_activation_hook(layer_idx):
         def hook(module, input, output):
             logits = output[2] if isinstance(output, (tuple, list)) else output
-            current_batch_activations[layer_idx] = logits.detach().to(torch.float16)
+            current_batch_activations[layer_idx] = logits.detach().to(torch.float16).cpu()
 
         return hook
 
@@ -118,55 +114,68 @@ if __name__ == "__main__":
     final_labels = []
     failed_matches = 0
 
-    batch_size = 16
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
+    BATCH_SIZE = 1
+    total_batches = (len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE
 
     # Batched Forward Pass & Logit Extraction
     print(f"\nStarting Trace Collection...")
 
-    for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, batch_size), total=total_batches)):
-        current_batch_activations.clear()
+    with torch.inference_mode():
+        for b_idx, batch_prompts in enumerate(tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=total_batches)):
+            current_batch_activations.clear()
 
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+            # Add return_offsets_mapping=True to the tokenizer call
+            inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, return_offsets_mapping=True)
 
-        if "token_type_ids" in inputs:
-            forward_args = inspect.signature(model.forward).parameters
-            if "token_type_ids" not in forward_args:
-                inputs.pop("token_type_ids")
+            # Pop the offsets before sending inputs to the model
+            offset_mappings = inputs.pop("offset_mapping").cpu().numpy()
+            inputs = inputs.to(model.device)
 
-        b_size, s_len = inputs.input_ids.shape
+            if "token_type_ids" in inputs:
+                forward_args = inspect.signature(model.forward).parameters
+                if "token_type_ids" not in forward_args:
+                    inputs.pop("token_type_ids")
 
-        with torch.no_grad():
+            b_size, s_len = inputs.input_ids.shape
+
             model(**inputs)
 
-        for l_idx in range(len(layer_names)):
-            if current_batch_activations[l_idx].dim() == 2:
-                current_batch_activations[l_idx] = current_batch_activations[l_idx].view(b_size, s_len, -1)
-
-        input_ids_np = inputs.input_ids.cpu().numpy()
-
-        for p_idx in range(b_size):
-            global_p_idx = (b_idx * batch_size) + p_idx
-            if global_p_idx >= len(tokenized_questions):
-                break
-
-            q_ids = tokenized_questions[global_p_idx]
-            start, end = find_token_range(q_ids, input_ids_np[p_idx], print_logging if b_idx == 0 and p_idx == 0 else False)
-
-            if start is None:
-                failed_matches += 1
-                continue
-
-            prompt_trace = []
-
             for l_idx in range(len(layer_names)):
-                token_probs = current_batch_activations[l_idx][p_idx, start : end + 1, :].cpu().numpy()
-                prompt_trace.append(token_probs)
+                if current_batch_activations[l_idx].dim() == 2:
+                    current_batch_activations[l_idx] = current_batch_activations[l_idx].view(b_size, s_len, -1)
 
-            stacked_trace = np.stack(prompt_trace, axis=1)
+            input_ids_np = inputs.input_ids.cpu().numpy()
 
-            final_traces.append(stacked_trace)
-            final_labels.append(labels[global_p_idx])
+            for p_idx in range(b_size):
+                global_p_idx = (b_idx * BATCH_SIZE) + p_idx
+
+                if global_p_idx >= len(prompts):  # Changed from tokenized_questions
+                    break
+
+                prompt_text = batch_prompts[p_idx]
+                q_text = final_user_questions[global_p_idx]
+
+                if b_idx == 0 and p_idx == 0:
+                    print(f"Prompt: {prompt_text}")
+
+                # Pass the raw text and offsets instead of the token IDs
+                start, end = find_token_range_by_offsets(prompt_text, q_text, offset_mappings[p_idx], print_logging if b_idx == 0 and p_idx == 0 else False)
+
+                if start is None:
+                    failed_matches += 1
+                    if print_logging:
+                        print(f"\nFailed to find token match for prompt index {global_p_idx}")
+                    continue
+
+                prompt_trace = []
+
+                for l_idx in range(len(layer_names)):
+                    token_probs = current_batch_activations[l_idx][p_idx, start : end + 1, :].cpu().numpy()
+                    prompt_trace.append(token_probs)
+
+                stacked_trace = np.stack(prompt_trace, axis=1)
+                final_traces.append(stacked_trace)
+                final_labels.append(labels[global_p_idx])
 
     for h in handles:
         h.remove()

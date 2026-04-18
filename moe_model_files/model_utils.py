@@ -3,7 +3,6 @@ import inspect
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
 import types
-import gc
 
 # Import modules from our codebase
 import data.data_utils as data_utils
@@ -12,6 +11,8 @@ import moe_model_files.compute_graph_patcher as compute_graph_patcher
 
 def load_model(full_model_name, quantize=False):
     model_name = full_model_name.split("/")[1]
+    d_map = {"": 1} if torch.cuda.device_count() > 1 else "auto"
+    d_map_judge = {"": 0} if torch.cuda.device_count() > 1 else "auto"
 
     if model_name == "Phi-3.5-MoE-instruct":
         if quantize:
@@ -19,7 +20,7 @@ def load_model(full_model_name, quantize=False):
             model = AutoModelForCausalLM.from_pretrained(
                 full_model_name,
                 torch_dtype="auto",
-                device_map="auto",
+                device_map=d_map,
                 quantization_config=quant_config,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=False,
@@ -28,22 +29,38 @@ def load_model(full_model_name, quantize=False):
             model = AutoModelForCausalLM.from_pretrained(
                 full_model_name,
                 torch_dtype="auto",
-                device_map="auto",
+                device_map=d_map,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=False,
             ).eval()
     elif model_name == "gpt-oss-20b":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=d_map,
+            trust_remote_code=True,
+        ).eval()
+    elif model_name == "Hunyuan-A13B-Instruct":
+        model = AutoModelForCausalLM.from_pretrained(
+            full_model_name,
             torch_dtype="auto",
             device_map="auto",
+            attn_implementation="flash_attention_2",
+            trust_remote_code=False,
+        ).eval()
+    elif model_name == "Llama-Guard-3-8B":
+        model = AutoModelForCausalLM.from_pretrained(
+            full_model_name,
+            torch_dtype="auto",
+            device_map=d_map_judge,
+            attn_implementation="flash_attention_2",
             trust_remote_code=True,
         ).eval()
     else:
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
             torch_dtype="auto",
-            device_map="auto",
+            device_map=d_map,
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
         ).eval()
@@ -92,7 +109,7 @@ def load_model(full_model_name, quantize=False):
                 layer.mlp.forward = types.MethodType(compute_graph_patcher.GptOssMLP_forward, layer.mlp)
                 if hasattr(layer.mlp, "router"):
                     layer.mlp.router.forward = types.MethodType(compute_graph_patcher.GptOssTopKRouter_forward, layer.mlp.router)
-                
+
                 # Replace experts
                 if hasattr(layer.mlp, "experts"):
                     old_experts = layer.mlp.experts
@@ -140,7 +157,7 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
     total_batches = (len(prompts) + batch_size - 1) // batch_size
     model.eval()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches, desc="Generating Responses"):
             input_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
 
@@ -151,12 +168,11 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
 
             input_ids = input_tokens["input_ids"]
 
-            # Generate with explicit pad_token_id
             output_ids = model.generate(
                 **input_tokens,
                 max_new_tokens=max_new_tokens,
                 return_dict_in_generate=True,
-                pad_token_id=tokenizer.pad_token_id,  # Required for clean batched generation
+                pad_token_id=tokenizer.pad_token_id,
             )
 
             # Slice out the prompt to isolate generated tokens
@@ -165,68 +181,25 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
             # Decode
             responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
             all_outputs.extend(responses)
-
-            del input_tokens, input_ids, output_ids, generated_tokens
-            gc.collect()
-            torch.cuda.empty_cache()
+            
+            for r in responses:
+                print(f"Generated response: {[r.strip()]}", flush=True)
 
     return all_outputs
 
 
-def generate_output_with_yield(model, model_name, tokenizer, prompts, batch_size):
-    if model_name in [
-        "gpt-oss-20b",
-        "Hunyuan-A13B-Instruct",
-    ]:
-        max_new_tokens = 2048  # We give thinking models more token budget
-    else:
-        max_new_tokens = 128
-
-    all_outputs = []
-    total_batches = (len(prompts) + batch_size - 1) // batch_size
-    model.eval()
-    with torch.no_grad():
-        for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches):
-            input_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-
-            if "token_type_ids" in input_tokens:
-                forward_args = inspect.signature(model.forward).parameters
-                if "token_type_ids" not in forward_args:
-                    input_tokens.pop("token_type_ids")
-
-            input_ids = input_tokens["input_ids"]
-
-            output_ids = model.generate(
-                **input_tokens,
-                max_new_tokens=max_new_tokens,
-                return_dict_in_generate=True,
-            )
-
-            generated_tokens = [output[ids.shape[-1] :] for ids, output in zip(input_ids, output_ids["sequences"])]
-
-            responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
-
-            # YIELD instead of extending a list
-            yield responses
-
-            # Force memory cleanup before the next batch loads
-            del input_tokens, input_ids, output_ids, generated_tokens
-            gc.collect()
-            torch.cuda.empty_cache()
-
-
 def moderate(model, tokenizer, prompt):
-    input_ids = tokenizer.apply_chat_template(prompt, return_tensors="pt").to(model.device)
+    inputs = tokenizer.apply_chat_template(prompt, padding=True, truncation=True, return_tensors="pt", return_dict=True).to(model.device)
+
     with torch.no_grad():
-        output = model.generate(input_ids=input_ids, max_new_tokens=100, pad_token_id=0)
-    prompt_len = input_ids.shape[-1]
+        output = model.generate(**inputs, max_new_tokens=10, pad_token_id=tokenizer.pad_token_id, do_sample=False)
+
+    prompt_len = inputs["input_ids"].shape[-1]
 
     return tokenizer.decode(output[0][prompt_len:], skip_special_tokens=True)
 
 
 def batched_moderate(model, tokenizer, batch_prompts):
-    # Pass the list of prompt dictionaries directly to apply_chat_template.
-    # Set return_dict=True and return_tensors="pt" to bypass manual tokenization entirely.
     inputs = tokenizer.apply_chat_template(batch_prompts, padding=True, truncation=True, return_tensors="pt", return_dict=True).to(model.device)
 
     with torch.no_grad():
@@ -234,5 +207,4 @@ def batched_moderate(model, tokenizer, batch_prompts):
 
     prompt_len = inputs.input_ids.shape[-1]
 
-    # Decode only the generation
     return tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
