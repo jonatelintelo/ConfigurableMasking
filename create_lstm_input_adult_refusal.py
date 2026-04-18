@@ -1,9 +1,7 @@
-import os
-
 import torch
-import torch.nn.functional as F
 import numpy as np
 import sys
+import os
 import inspect
 from tqdm import tqdm
 
@@ -77,13 +75,13 @@ if __name__ == "__main__":
             print(f"Test tensor on GPU: {torch.rand(5).cuda().device}")
 
     models = [
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "microsoft/Phi-3.5-MoE-instruct",
-        "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        "openai/gpt-oss-20b",
-        "Qwen/Qwen1.5-MoE-A2.7B-Chat",
-        "tencent/Hunyuan-A13B-Instruct",
-        "deepseek-ai/deepseek-moe-16b-chat",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",  # 0
+        "microsoft/Phi-3.5-MoE-instruct",  # 1
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",  # 2
+        "openai/gpt-oss-20b",  # 3
+        "Qwen/Qwen1.5-MoE-A2.7B-Chat",  # 4
+        "tencent/Hunyuan-A13B-Instruct",  # 5
+        "deepseek-ai/deepseek-moe-16b-chat",  # 6
     ]
 
     model_config = model_configurations.models[models[model_id]]
@@ -109,13 +107,14 @@ if __name__ == "__main__":
         module = dict(model.named_modules())[name]
         handles.append(module.register_forward_hook(get_activation_hook(i)))
 
-    failed_matches = 0
     final_traces = []
     final_labels = []
+    failed_matches = 0
 
     BATCH_SIZE = 32
     total_batches = (len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE
 
+    # Batched Forward Pass & Logit Extraction
     print(f"\nStarting Trace Collection...")
 
     with torch.inference_mode():
@@ -138,8 +137,6 @@ if __name__ == "__main__":
 
             model(**inputs)
 
-            # Reshape all layers on the GPU *once* per batch
-            # This prevents doing .view() inside the prompt loop over and over
             for l_idx in range(len(layer_names)):
                 if current_batch_activations[l_idx].dim() == 2:
                     current_batch_activations[l_idx] = current_batch_activations[l_idx].view(b_size, s_len, -1)
@@ -148,7 +145,7 @@ if __name__ == "__main__":
 
             for p_idx in range(b_size):
                 global_p_idx = (b_idx * BATCH_SIZE) + p_idx
-                
+
                 if global_p_idx >= len(prompts):  # Changed from tokenized_questions
                     break
 
@@ -170,8 +167,6 @@ if __name__ == "__main__":
                 prompt_trace = []
 
                 for l_idx in range(len(layer_names)):
-                    # Slice on the GPU first, THEN send that tiny sliver to the CPU
-                    # current_batch_activations is already 3D at this point.
                     token_probs = current_batch_activations[l_idx][p_idx, start : end + 1, :].cpu().numpy()
                     prompt_trace.append(token_probs)
 

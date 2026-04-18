@@ -72,9 +72,8 @@ if __name__ == "__main__":
     model_config = model_configurations.models[models[model_id]]
     print(f"\nInitializing: {model_config.model_name}")
 
-    model, tokenizer = model_utils.load_model(models[model_id])
+    model, tokenizer = model_utils.load_model(models[model_id])  # Function laod_model already puts model on device and in .eval() mode
 
-    # Load Balanced Data
     conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=False)
 
     prompts = []
