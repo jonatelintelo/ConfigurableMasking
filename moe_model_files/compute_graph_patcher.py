@@ -98,13 +98,11 @@ def GptOssTopKRouter_forward(self, hidden_states):
 
 def GptOssMLP_forward(self, hidden_states):
     router_logits = self.router(hidden_states)  # (num_experts, seq_len)
-    # We hardcode the topk expert (4) for the 20b model; change it for bigger one
     router_top_value, router_indices = torch.topk(router_logits, 4, dim=-1)  # (seq_len, top_k)
-    router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
-    router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+    router_top_value = torch.nn.functional.softmax(router_top_value.float(), dim=1).to(hidden_states.dtype)
+    router_scores = torch.zeros_like(router_logits, dtype=hidden_states.dtype).scatter_(1, router_indices, router_top_value)
     routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
-    return routed_out, router_scores
-
+    return routed_out.to(hidden_states.dtype), router_scores
 
 class GptOssGateUpLayer(nn.Module):
     def __init__(self, hidden_size, expert_dim):
