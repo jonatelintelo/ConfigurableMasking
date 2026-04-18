@@ -1,4 +1,7 @@
 import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -79,7 +82,7 @@ def discover_universal_steering_circuit(lstm_model, dataloader, num_layers, num_
     criterion = nn.BCEWithLogitsLoss()
 
     lstm_model.train()
-    
+
     for param in lstm_model.parameters():
         param.requires_grad = False
 
@@ -87,7 +90,7 @@ def discover_universal_steering_circuit(lstm_model, dataloader, num_layers, num_
 
     for epoch in tqdm(range(epochs), desc="Optimizing Circuit", unit="epoch"):
         total_loss, bce_loss_sum = 0, 0
-        
+
         for batch_logits, batch_lengths in dataloader:
             batch_logits = batch_logits.to(device)
             batch_lengths = batch_lengths.cpu()
@@ -125,27 +128,53 @@ def discover_universal_steering_circuit(lstm_model, dataloader, num_layers, num_
 # 3. Phase 2: Inference Steering Hooks
 # ==========================================
 class ModelAwareSteeringHook:
-    def __init__(self, model_name, layer_name, steering_vector, alpha):
+    def __init__(self, model_name, layer_name, steering_vector, alpha, top_k=6):
         self.model_name = model_name
         self.layer_name = layer_name
         self.steering_vector = steering_vector
         self.alpha = alpha
+        self.top_k = top_k  # DeepSeek 16b typically routes to 6 experts
 
     def __call__(self, module, inputs, output):
-        logits = output[0] if isinstance(output, (tuple, list)) else output
-        
+        # Extract raw logits. In DeepSeek, the gate output is typically a tuple:
+        # e.g., (topk_indices, topk_weights, raw_logits)
+        if isinstance(output, (tuple, list)) and len(output) >= 3:
+            logits = output[2]
+        else:
+            logits = output
+
         if self.steering_vector.device != logits.device:
             self.steering_vector = self.steering_vector.to(logits.device)
 
+        # 1. Apply steering to the raw logits
         sigma_l = logits.std() + 1e-5
-        steered = logits + (self.alpha * sigma_l * self.steering_vector)
+        steered_logits = logits + (self.alpha * sigma_l * self.steering_vector)
 
-        if isinstance(output, tuple):
-            return (steered,) + output[1:]
-        elif isinstance(output, list):
-            return [steered] + output[1:]
-        
-        return steered
+        # 2. If it's a MoE gate, recompute the top-K routing!
+        if isinstance(output, (tuple, list)) and len(output) >= 3:
+            # Calculate new probabilities from the steered logits
+            scores = steered_logits.softmax(dim=-1)
+
+            # Recompute the winning experts and their weights
+            topk_weights, topk_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+            # 3. Robustly reconstruct the tuple.
+            # We check the dtype of original output[0] to match the expected order.
+            # If the original model returns (indices, weights, logits), output[0] is an integer.
+            is_output0_indices = output[0].dtype in (torch.int8, torch.int16, torch.int32, torch.int64)
+
+            if is_output0_indices:
+                new_output = [topk_indices, topk_weights, steered_logits]
+            else:
+                new_output = [topk_weights, topk_indices, steered_logits]
+
+            # Preserve any extra items in the tuple if they exist
+            if len(output) > 3:
+                new_output.extend(list(output[3:]))
+
+            return tuple(new_output) if isinstance(output, tuple) else new_output
+
+        return steered_logits
 
 
 def apply_steering_hooks(model_name, model, gate_name, sparse_S, alpha):
@@ -211,23 +240,23 @@ if __name__ == "__main__":
     all_logits, all_lengths = [], []
     current_batch_activations = {}
 
-    def get_collection_hook(layer_index):
-        def hook(module, inp, out):
-            logits = out[0] if isinstance(out, (tuple, list)) else out
-            current_batch_activations[layer_index] = logits.detach().cpu()
+    def get_activation_hook(layer_idx):
+        def hook(module, input, output):
+            logits = output[2] if isinstance(output, (tuple, list)) else output
+            current_batch_activations[layer_idx] = logits.detach().to(torch.float16).cpu()
 
         return hook
 
     collection_handles = []
     layer_idx = 0
-    
+
     for layer_name, module in model.named_modules():
         if layer_name.lower().endswith(model_config.gate_name.lower()):
-            collection_handles.append(module.register_forward_hook(get_collection_hook(layer_idx)))
+            collection_handles.append(module.register_forward_hook(get_activation_hook(layer_idx)))
             layer_idx += 1
 
     BATCH_SIZE = 16
-    
+
     for b_idx, batch_prompts in enumerate(
         tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE, desc="Collect Baseline Logits")
     ):
@@ -240,7 +269,7 @@ if __name__ == "__main__":
             model(**inputs)
 
         b_size, s_len = inputs.input_ids.shape
-        
+
         for l_idx in range(layer_idx):
             if current_batch_activations[l_idx].dim() == 2:
                 current_batch_activations[l_idx] = current_batch_activations[l_idx].view(b_size, s_len, -1)
@@ -271,22 +300,13 @@ if __name__ == "__main__":
 
     # --- Step 2: Circuit Discovery & Generation ---
     configs_to_test = [
-        {"lambda": 0, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8, 2.0]},
-        {"lambda": 1e-5, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8, 2.0]},
-        {"lambda": 1e-4, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8, 2.0]},
-        {"lambda": 1e-3, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8, 2.0]},
-        {"lambda": 1e-1, "alphas": [0.2, 0.4, 0.6, 0.8, 1.2, 1.5, 1.8, 2.0]},
+        {"lambda": 0, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        {"lambda": 1e-5, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        {"lambda": 1e-4, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        {"lambda": 1e-3, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
     ]
 
     all_experiment_results = []  # To store responses for deferred safety evaluation
-    current_batch_topk = {}
-
-    def get_topk_hook(layer_idx, k):
-        def hook(module, input, output):
-            logits = output[0] if isinstance(output, (tuple, list)) else output
-            current_batch_topk[layer_idx] = torch.topk(logits, k=k, dim=-1, sorted=False).indices.detach().cpu().to(torch.int16)
-
-        return hook
 
     for config in configs_to_test:
         _lambda = config["lambda"]
@@ -301,7 +321,7 @@ if __name__ == "__main__":
         lstm.load_state_dict(checkpoint["model_state_dict"])
 
         S_optimized = discover_universal_steering_circuit(lstm, trace_dataloader, NUM_LAYERS, NUM_TOTAL_EXPERTS, 0.0, _lambda, 0.05, 100, 0.1)
-        
+
         S_abs = torch.abs(S_optimized).detach().cpu().numpy().flatten()
         print("\n" + "=" * 40)
         print(f"S TENSOR DISTRIBUTION ANALYSIS (Lambda: {_lambda})")
@@ -330,7 +350,7 @@ if __name__ == "__main__":
             print(f"\nRUNNING GENERATION: {experiment_id}")
 
             active_steering_hooks = apply_steering_hooks(model_config.model_name, model, model_config.gate_name, S_sparse, steering_alpha)
-            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=BATCH_SIZE)
+            eval_responses = model_utils.generate_output(model, model_config.model_name, tokenizer, eval_prompts, batch_size=8)
 
             for hook in active_steering_hooks:
                 hook.remove()
@@ -344,7 +364,7 @@ if __name__ == "__main__":
     flush()  # Crucial: Frees ~60GB+ before loading Llama-Guard
 
     judge_model_name = "meta-llama/Llama-Guard-3-8B"
-    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name)
+    judge_model, judge_tokenizer = model_utils.load_model(judge_model_name, quantize=True)
     safety_evaluator = SafetyEvaluator(judge_model, judge_tokenizer)
 
     jailbreak_data_path = f"{root_folder}/data/jailbreak/jailbreak_contexts_{model_config.model_name}.jsonl"
@@ -365,7 +385,7 @@ if __name__ == "__main__":
 
         save_path = os.path.join(root_folder, "results", "steered_responses", model_config.model_name)
         os.makedirs(save_path, exist_ok=True)
-        
+
         with open(os.path.join(save_path, f"responses_{exp['id']}.json"), "w", encoding="utf-8") as f:
             json.dump(responses_to_save, f, indent=4, ensure_ascii=False)
 
