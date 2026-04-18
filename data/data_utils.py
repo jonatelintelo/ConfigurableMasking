@@ -19,7 +19,7 @@ def load_data(directory):
 def load_adult_refusal_dataset(root_folder, model_name, malicious_only):
     # Load the adult refusal prompts (Label 1)
     adult_refusal_data_path = f"{root_folder}/data/adult_refusal/{model_name}_adult_refusal_prompts.jsonl"
-    adult_refusal_prompts = list(load_dataset("json", data_files=adult_refusal_data_path, split="train")["conversation_history"])
+    adult_refusal_prompts = list(load_dataset("json", data_files=adult_refusal_data_path, split="train")["prompt"])
 
     if malicious_only:
         prompts = adult_refusal_prompts
