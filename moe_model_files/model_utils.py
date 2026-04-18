@@ -19,7 +19,7 @@ def load_model(full_model_name, quantize=False):
             quant_config = BitsAndBytesConfig(load_in_8bit=True)
             model = AutoModelForCausalLM.from_pretrained(
                 full_model_name,
-                torch_dtype="auto",
+                dtype="auto",
                 device_map=d_map,
                 quantization_config=quant_config,
                 attn_implementation="flash_attention_2",
@@ -28,7 +28,7 @@ def load_model(full_model_name, quantize=False):
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 full_model_name,
-                torch_dtype="auto",
+                dtype="auto",
                 device_map=d_map,
                 attn_implementation="flash_attention_2",
                 trust_remote_code=False,
@@ -36,14 +36,14 @@ def load_model(full_model_name, quantize=False):
     elif model_name == "gpt-oss-20b":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map=d_map,
+            dtype=torch.bfloat16,
+            device_map="auto",
             trust_remote_code=True,
         ).eval()
     elif model_name == "Hunyuan-A13B-Instruct":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
-            torch_dtype="auto",
+            dtype="auto",
             device_map="auto",
             attn_implementation="flash_attention_2",
             trust_remote_code=False,
@@ -51,7 +51,7 @@ def load_model(full_model_name, quantize=False):
     elif model_name == "Llama-Guard-3-8B":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
-            torch_dtype="auto",
+            dtype="auto",
             device_map=d_map_judge,
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
@@ -59,7 +59,7 @@ def load_model(full_model_name, quantize=False):
     else:
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
-            torch_dtype="auto",
+            dtype="auto",
             device_map=d_map,
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
