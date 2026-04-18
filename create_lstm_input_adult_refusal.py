@@ -111,7 +111,7 @@ if __name__ == "__main__":
     final_labels = []
     failed_matches = 0
 
-    BATCH_SIZE = 32
+    BATCH_SIZE = 16
     total_batches = (len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE
 
     # Batched Forward Pass & Logit Extraction

@@ -155,7 +155,6 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
 
     all_outputs = []
     total_batches = (len(prompts) + batch_size - 1) // batch_size
-    model.eval()
 
     with torch.inference_mode():
         for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches, desc="Generating Responses"):

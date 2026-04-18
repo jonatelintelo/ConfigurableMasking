@@ -80,7 +80,7 @@ def process_conversations_batched(conversations, model, tokenizer, safety_evalua
                 msg = messages[active_conv["msg_idx"]]
                 active_conv["context"].append({"role": "user", "content": msg["body"]})
 
-                MAX_WINDOW = 8
+                MAX_WINDOW = 8 if model_name in ["gpt-oss-20b", "Hunyuan-A13B-Instruct"] else 30
 
                 if len(active_conv["context"]) > MAX_WINDOW:
                     # Keep the system prompt, then take the most recent (MAX_WINDOW - 1) messages
