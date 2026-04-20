@@ -30,7 +30,7 @@ class SafetyEvaluator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    def evaluate(self, conversation_histories, generated_text, batch_size=16):
+    def evaluate(self, conversation_histories, generated_text, batch_size):
         judge_prompts = data_utils.construct_judge_prompt_histories(histories=conversation_histories, responses=generated_text)
         safety_flags = []
         total_batches = (len(judge_prompts) + batch_size - 1) // batch_size
@@ -143,17 +143,36 @@ class ModelAwareSteeringHook:
         else:
             logits = output
 
-        if self.steering_vector.device != logits.device:
-            self.steering_vector = self.steering_vector.to(logits.device)
+        is_gpt_oss = (self.model_name == "gpt-oss-20b" or self.model_name == "openai/gpt-oss-20b")
+
+        if is_gpt_oss:
+            # Strict alignment to avoid bfloat16 -> float32 promotion
+            if self.steering_vector.device != logits.device or self.steering_vector.dtype != logits.dtype:
+                self.steering_vector = self.steering_vector.to(device=logits.device, dtype=logits.dtype)
+        else:
+            # Original behavior
+            if self.steering_vector.device != logits.device:
+                self.steering_vector = self.steering_vector.to(logits.device)
 
         # 1. Apply steering to the raw logits
         sigma_l = logits.std() + 1e-5
-        steered_logits = logits + (self.alpha * sigma_l * self.steering_vector)
+
+        if is_gpt_oss:
+            # Cast back to original dtype in case alpha or sigma_l forced an upcast
+            steered_logits = (logits + (self.alpha * sigma_l * self.steering_vector)).to(logits.dtype)
+        else:
+            # Original behavior
+            steered_logits = logits + (self.alpha * sigma_l * self.steering_vector)
 
         # 2. If it's a MoE gate, recompute the top-K routing!
         if isinstance(output, (tuple, list)) and len(output) >= 3:
             # Calculate new probabilities from the steered logits
-            scores = steered_logits.softmax(dim=-1)
+            if is_gpt_oss:
+                # Use float32 for softmax numerical stability, then cast back
+                scores = steered_logits.to(torch.float32).softmax(dim=-1).to(logits.dtype)
+            else:
+                # Original behavior
+                scores = steered_logits.softmax(dim=-1)
 
             # Recompute the winning experts and their weights
             topk_weights, topk_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
@@ -221,9 +240,18 @@ if __name__ == "__main__":
     conversation_histories, labels = data_utils.load_jailbreak_dataset(root_folder=root_folder, model_name=model_config.model_name, malicious_only=True)
     prompts, final_user_questions, eval_histories = [], [], []
 
+    MAX_WINDOW = 8 if model_config.model_name in ["gpt-oss-20b", "Hunyuan-A13B-Instruct"] else 30
+
     for history in conversation_histories:
         final_user_questions.append(history[-1]["content"])
-        chat = [m for m in history if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else history
+        system_msg = history[0]
+
+        recent_context = history[-(MAX_WINDOW - 1) :]
+        current_context_window = [system_msg] + recent_context
+
+        chat = [m for m in current_context_window if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else current_context_window
+        # chat = [m for m in history if m["role"] != "system"] if model_config.model_name == "deepseek-moe-16b-chat" else history
+
         eval_histories.append([m for m in history if m["role"] != "system"])
 
         prompt = tokenizer.apply_chat_template(
@@ -255,7 +283,7 @@ if __name__ == "__main__":
             collection_handles.append(module.register_forward_hook(get_activation_hook(layer_idx)))
             layer_idx += 1
 
-    BATCH_SIZE = 16
+    BATCH_SIZE = 2 if model_config.model_name in ["gpt-oss-20b", "Hunyuan-A13B-Instruct"] else 16
 
     for b_idx, batch_prompts in enumerate(
         tqdm(data_utils.batchify(prompts, BATCH_SIZE), total=(len(prompts) + BATCH_SIZE - 1) // BATCH_SIZE, desc="Collect Baseline Logits")
@@ -301,9 +329,9 @@ if __name__ == "__main__":
     # --- Step 2: Circuit Discovery & Generation ---
     configs_to_test = [
         {"lambda": 0, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
-        {"lambda": 1e-5, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
-        {"lambda": 1e-4, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
-        {"lambda": 1e-3, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        # {"lambda": 1e-5, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        # {"lambda": 1e-4, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
+        # {"lambda": 1e-3, "alphas": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]},
     ]
 
     all_experiment_results = []  # To store responses for deferred safety evaluation
@@ -320,6 +348,7 @@ if __name__ == "__main__":
         lstm = lstm_model.MoETraceClassifierLinear(NUM_TOTAL_EXPERTS, NUM_LAYERS).to(device)
         lstm.load_state_dict(checkpoint["model_state_dict"])
 
+        # epochs = 200 if model_config.model_name in ["gpt-oss-20b", "Hunyuan-A13B-Instruct"] else 100
         S_optimized = discover_universal_steering_circuit(lstm, trace_dataloader, NUM_LAYERS, NUM_TOTAL_EXPERTS, 0.0, _lambda, 0.05, 100, 0.1)
 
         S_abs = torch.abs(S_optimized).detach().cpu().numpy().flatten()
@@ -373,7 +402,7 @@ if __name__ == "__main__":
 
     for exp in all_experiment_results:
         print(f"\nEvaluating Safety for: {exp['id']}")
-        safety_flags = safety_evaluator.evaluate(eval_chat_histories, exp["responses"])
+        safety_flags = safety_evaluator.evaluate(eval_chat_histories, exp["responses"], batch_size=16)
 
         safe_count = safety_flags.count(False)
         print(f"---> Metric for {exp['id']}: {safe_count}/{EVAL_SIZE} SAFE.")

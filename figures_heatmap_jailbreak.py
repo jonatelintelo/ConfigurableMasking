@@ -3,7 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-import argparse
+
+import argument_parser as argument_parser
+
 
 def calculate_expert_frequencies(topk_data, num_experts=None):
     """
@@ -38,8 +40,21 @@ def calculate_expert_frequencies(topk_data, num_experts=None):
 
 def main():
     # Adjust these paths to match your folder structure
-    root_folder = "./" 
-    model_name = "deepseek-moe-16b-chat"  # Replace with the model you want to plot
+    arguments = argument_parser.parse_arguments()
+    root_folder = arguments.root
+
+    all_models = [
+        ("Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen3"),
+        ("microsoft/Phi-3.5-MoE-instruct", "Phi"),
+        ("mistralai/Mixtral-8x7B-Instruct-v0.1", "Mixtral"),
+        ("openai/gpt-oss-20b", "GPT"),
+        ("Qwen/Qwen1.5-MoE-A2.7B-Chat", "Qwen1.5"),
+        ("tencent/Hunyuan-A13B-Instruct", "Hunyuan"),
+        ("deepseek-ai/deepseek-moe-16b-chat", "DeepSeek"),
+    ]
+
+    model_name = "Phi-3.5-MoE-instruct"
+    print(f"\nInitializing: {model_name}")
     
     baseline_path = os.path.join(root_folder, "results", "topk", "jailbreak", f"{model_name}_baseline_topk.pt")
     steered_path = os.path.join(root_folder, "results", "topk", "jailbreak", f"{model_name}_steered_topk.pt")
@@ -54,36 +69,48 @@ def main():
     # Pass the same num_experts to steered to ensure identical matrix dimensions
     steered_freq, _ = calculate_expert_frequencies(steered_data, num_experts=num_experts)
 
+    # Calculate the difference (Steered - Baseline)
+    # Positive: Selected MORE often during steering
+    # Negative: Selected LESS often during steering
+    diff_freq = steered_freq - baseline_freq
+
     print("Generating plot...")
-    fig, axes = plt.subplots(1, 2, figsize=(18, 8), sharey=True)
+    plt.figure(figsize=(12, 10)) # Slightly adjusted to accommodate the square aspect ratio
     
-    # Shared settings for the heatmaps
-    cmap = "viridis"  # "magma" or "Blues" also look great for frequency maps
-    vmax = max(baseline_freq.max(), steered_freq.max()) # Ensure color scale matches exactly
-
-    # Subplot 1: Baseline
-    sns.heatmap(baseline_freq, ax=axes[0], cmap=cmap, vmin=0, vmax=vmax, 
-                cbar_kws={'label': 'Activation Frequency'})
-    axes[0].set_title(f"Baseline Expert Activation\n({model_name})", fontsize=14, pad=10)
-    axes[0].set_xlabel("Expert Index", fontsize=12)
-    axes[0].set_ylabel("Layer Index", fontsize=12)
-    axes[0].invert_yaxis() # Put Layer 0 at the bottom
-
-    # Subplot 2: Steered
-    sns.heatmap(steered_freq, ax=axes[1], cmap=cmap, vmin=0, vmax=vmax,
-                cbar_kws={'label': 'Activation Frequency'})
-    axes[1].set_title(f"Steered Expert Activation\n({model_name})", fontsize=14, pad=10)
-    axes[1].set_xlabel("Expert Index", fontsize=12)
-    axes[1].invert_yaxis()
+    # To make the diverging colormap symmetric around 0, find the max absolute difference
+    max_abs_diff = np.max(np.abs(diff_freq))
+    
+    # Plot single heatmap using a diverging colormap
+    ax = sns.heatmap(
+        diff_freq, 
+        cmap="RdBu_r",       
+        center=0,              
+        vmin=-max_abs_diff,    
+        vmax=max_abs_diff,     
+        square=True,           # <-- Forces cells to be perfect squares
+        cbar_kws={'label': 'Change in Frequency (Steered - Baseline)'}
+    )
+    
+    # Removes the little tick lines on the axes
+    ax.tick_params(left=False, bottom=False)
+    
+    ax.set_title(f"Change in Expert Activation Frequency\n({model_name})", fontsize=14, pad=10)
+    ax.set_xlabel("Expert Index", fontsize=12)
+    ax.set_ylabel("Layer Index", fontsize=12)
+    ax.invert_yaxis() # Put Layer 0 at the bottom
 
     plt.tight_layout()
     
     # Save and show
     save_dir = os.path.join(root_folder, "results", "figures")
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"{model_name}_expert_frequency_comparison.png")
     
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    # 1. Change the extension to .pdf
+    save_path = os.path.join(save_dir, f"{model_name}_jailbreak_heatmap.pdf")
+    
+    # 2. Save as format='pdf' and remove dpi (PDFs are vector format)
+    plt.savefig(save_path, format='pdf', bbox_inches="tight")
+    
     print(f"Plot saved to: {save_path}")
     plt.show()
 

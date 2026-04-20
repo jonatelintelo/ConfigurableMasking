@@ -36,7 +36,7 @@ def load_model(full_model_name, quantize=False):
     elif model_name == "gpt-oss-20b":
         model = AutoModelForCausalLM.from_pretrained(
             full_model_name,
-            dtype=torch.bfloat16,
+            dtype="auto",
             device_map="auto",
             trust_remote_code=True,
         ).eval()
@@ -141,6 +141,7 @@ def load_model(full_model_name, quantize=False):
         # We can set pad_token as the eos_token or add a new one
         tokenizer.pad_token = tokenizer.eos_token
 
+    model.eval()
     return model, tokenizer
 
 
@@ -153,9 +154,10 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
     else:
         max_new_tokens = 128
 
-    all_outputs = []
+    all_outputs = [None] * len(prompts)
     total_batches = (len(prompts) + batch_size - 1) // batch_size
 
+    model.eval()
     with torch.inference_mode():
         for batch_prompts in tqdm(data_utils.batchify(prompts, batch_size), total=total_batches, desc="Generating Responses"):
             input_tokens = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
@@ -180,9 +182,64 @@ def generate_output(model, model_name, tokenizer, prompts, batch_size):
             # Decode
             responses = [tokenizer.decode(generated_tokens[i], skip_special_tokens=True).strip() for i in range(len(generated_tokens))]
             all_outputs.extend(responses)
-            
+
             for r in responses:
                 print(f"Generated response: {[r.strip()]}", flush=True)
+
+    return all_outputs
+
+
+def generate_output_sorted(model, model_name, tokenizer, prompts, batch_size):
+    if model_name in [
+        "gpt-oss-20b",
+        "Hunyuan-A13B-Instruct",
+    ]:
+        max_new_tokens = 1024
+    else:
+        max_new_tokens = 128
+
+    # 1. Sort by length, keeping original indices
+    indexed_prompts = sorted(enumerate(prompts), key=lambda x: len(x[1]))
+
+    # Pre-allocate array for final outputs
+    all_outputs = [None] * len(prompts)
+    total_batches = (len(prompts) + batch_size - 1) // batch_size
+
+    model.eval()
+    with torch.inference_mode():
+        # 2. Pass the SORTED tuples (original_idx, prompt_text) into your batchify function
+        for batch_data in tqdm(data_utils.batchify(indexed_prompts, batch_size), total=total_batches, desc="Generating Responses"):
+
+            # Unpack the batch into separate lists for indices and text
+            batch_indices = [item[0] for item in batch_data]
+            batch_texts = [item[1] for item in batch_data]
+
+            input_tokens = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+
+            if "token_type_ids" in input_tokens:
+                forward_args = inspect.signature(model.forward).parameters
+                if "token_type_ids" not in forward_args:
+                    input_tokens.pop("token_type_ids")
+
+            input_ids = input_tokens["input_ids"]
+
+            output_ids = model.generate(
+                **input_tokens,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+            # Slice out the prompt to isolate generated tokens
+            generated_tokens = [output[ids.shape[-1] :] for ids, output in zip(input_ids, output_ids["sequences"])]
+
+            # Decode
+            responses = [tokenizer.decode(generated_tokens[k], skip_special_tokens=True).strip() for k in range(len(generated_tokens))]
+
+            # 3. Use the original indices to place responses in the correct order
+            for original_idx, response in zip(batch_indices, responses):
+                all_outputs[original_idx] = response
+                print(f"Generated response: {[response]}", flush=True)
 
     return all_outputs
 
